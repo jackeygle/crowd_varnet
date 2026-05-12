@@ -1,0 +1,24 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.bak
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+*.egg-info/
+dist/
+build/
+
+# 训练 checkpoint、可视化、Slurm 日志（体积大）
+runs/
+logs/
+*.out
+slurm-*.out
+
+# 权重与 HDF5 缓存（勿提交大文件；用 README 说明下载路径）
+*.pt
+*.pth
+*.hkl
+data/ATC/grid_cache/

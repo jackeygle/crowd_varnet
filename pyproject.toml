@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "crowd-varnet"
+version = "0.1.0"
+description = "Variational crowd-state reconstruction with frozen PedPred (self-contained ATC loaders + vendored PedPred grid)"
+requires-python = ">=3.9"
+dependencies = [
+    "numpy>=1.20",
+    "torch>=1.10",
+    "h5py>=3.0",
+    "matplotlib>=3.5",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+# PedPred 教师训练、.hkl checkpoint、TensorBoard 等
+teacher = [
+    "tqdm>=4.60",
+    "configargparse>=1.5",
+    "hickle>=5.0",
+    "petname>=2.0",
+    "tensorboard>=2.10",
+    "GitPython>=3.1",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["crowd_varnet*"]
