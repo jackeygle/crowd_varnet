@@ -1,3 +1,8 @@
+"""
+**PedPred 教师网络**（Encoder–Forecaster 等）——与同化模块 ``crowd_varnet.assimilation_model`` 中的
+``FrozenPedPredPrior`` / ``load_frozen_pedpred`` 配合使用；checkpoint 权重对应本文件中的 ``PedPred_v4`` 等。
+"""
+
 from abc import ABC, abstractmethod
 from functools import lru_cache
 from math import ceil, floor
@@ -116,6 +121,11 @@ class ConvGRUCell(Module):
 class Conv1dGRU(ConvGRUCell):
     def __init__(self, *args, **kwargs):
         super().__init__(torch.nn.Conv1d, *args, **kwargs)
+
+
+class Conv2dGRU(ConvGRUCell):
+    def __init__(self, *args, **kwargs):
+        super().__init__(torch.nn.Conv2d, *args, **kwargs)
 
 
 class Conv3dGRU(ConvGRUCell):
@@ -398,121 +408,36 @@ class EncoderForecaster(Module):
 
 
 # ==========================================
-# 物理损失函数
-# 4通道，vel_logvar 不参与损失，兼容 GridData
 # ==========================================
-
-def spatial_divergence(density: Tensor, velocity: Tensor) -> Tensor:
-    """∇·(ρv)，用于连续性方程约束"""
-    rho    = density.exp()
-    rho_vx = rho * velocity[:, :, 0:1]
-    rho_vy = rho * velocity[:, :, 1:2]
-
-    sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]],
-                            dtype=density.dtype, device=density.device).view(1, 1, 3, 3) / 8.0
-    sobel_y = sobel_x.transpose(2, 3)
-
-    B, T, _, H, W = rho_vx.shape
-    d_dx = F.conv2d(rho_vx.view(B * T, 1, H, W), sobel_x, padding=1)
-    d_dy = F.conv2d(rho_vy.view(B * T, 1, H, W), sobel_y, padding=1)
-    return (d_dx + d_dy).view(B, T, 1, H, W)
-
-
-def physics_informed_loss(
-    pred_seq,
-    target_seq,
-    density_threshold: float = -2.0,
-    *,
-    w_den:  float = 10.0,
-    w_vel:  float = 5.0,
-    w_dir:  float = 0.5,
-    w_cont: float = 1.0,
-):
-    """
-    shape: [B, T, C=4, H, W]
-    C=4: logdensity(1) + vel_mean(2) + vel_logvar(1)
-    vel_logvar 不参与损失，完全兼容 GridData 4通道格式。
-    """
-    pred_den, pred_vel, _ = pred_seq.split((1, 2, 1), dim=2)
-    targ_den, targ_vel, _ = target_seq.split((1, 2, 1), dim=2)
-
-    # 防止目标 logdensity 中的 -inf 导致梯度爆炸
-    targ_den = torch.clamp(targ_den, min=-20.0)
-
-    # 1. 密度损失（实际密度域，防止背景对数误差主导梯度）
-    loss_den = F.mse_loss(pred_den.exp(), targ_den.exp())
-
-    # 2. 软密度权重掩码
-    weight       = torch.sigmoid((targ_den - density_threshold) * 2.0)
-    valid_pixels = weight.sum() + 1e-6
-
-    # 3. 速度 MSE（软权重）
-    loss_vel = (F.mse_loss(pred_vel, targ_vel, reduction="none") * weight).sum() / valid_pixels
-
-    # 4. x/y 方向分量损失
-    pvx, pvy = pred_vel.split(1, dim=2)
-    tvx, tvy = targ_vel.split(1, dim=2)
-    loss_vel_x = (F.mse_loss(pvx, tvx, reduction="none") * weight).sum() / valid_pixels
-    loss_vel_y = (F.mse_loss(pvy, tvy, reduction="none") * weight).sum() / valid_pixels
-    loss_dir   = loss_vel_x + loss_vel_y
-
-    # 5. 连续性方程残差（∂ρ/∂t + ∇·(ρv) ≈ 0）
-    div       = spatial_divergence(pred_den, pred_vel)
-    dpdt      = pred_den[:, 1:] - pred_den[:, :-1]
-    loss_cont = F.mse_loss(dpdt, -div[:, :-1])
-
-    total_loss = (
-        w_den  * loss_den  +
-        w_vel  * loss_vel  +
-        w_dir  * loss_dir  +
-        w_cont * loss_cont
-    )
-
-    return (
-        total_loss,
-        loss_den.item(),
-        loss_vel.item(),
-        loss_vel_x.item(),
-        loss_vel_y.item(),
-        loss_cont.item(),
-    )
-
-
+# v11: v10_gru + 温和扩容 hid (24, 48, 192)
 # ==========================================
-# 最终模型 PedPred_v4
-# Conv2dGRU 全部替换为 Conv2dSTLSTM（双记忆结构）
-# 4通道，完全兼容 GridData
-# ==========================================
-
 @export
-class PedPred_v4(EncoderForecaster):
+class PedPred_v11_grustack_mid(EncoderForecaster):
+    """v10 同结构，hidden 维度温和扩 1.5×（hid 24/48/192）。"""
     def __init__(self, *args, **kwargs):
-        C = 1 + 2 + 1   # logdensity(1) + vel_mean(2) + vel_logvar(1)
-
+        C = 1 + 2 + 1
         rnn_kwargs = dict(in_kernel_size=3, hidden_kernel_size=5, activation=LeakyReLU(0.2))
-
-        hid0, hid1, hid2 = 16, 32, 128
+        hid0, hid1, hid2 = 24, 48, 192
 
         encoder = Encoder(
-            Conv2d(C, prev := 16, kernel_size=3, stride=1, padding=1), LeakyReLU(0.2),
-            Conv2dSTLSTM(prev, prev := hid0, **rnn_kwargs),
-            Conv2d(prev, prev := 32, kernel_size=3, stride=2, padding=1), LeakyReLU(0.2),
-            Conv2dSTLSTM(prev, prev := hid1, **rnn_kwargs),
-            Conv2d(prev, prev := 64, kernel_size=3, stride=2, padding=1), LeakyReLU(0.2),
-            Conv2dSTLSTM(prev, prev := hid2, **rnn_kwargs),
+            Conv2d(C, prev := 24, kernel_size=3, stride=1, padding=1), LeakyReLU(0.2),
+            Conv2dGRU(prev, prev := hid0, **rnn_kwargs),
+            Conv2d(prev, prev := 48, kernel_size=3, stride=2, padding=1), LeakyReLU(0.2),
+            Conv2dGRU(prev, prev := hid1, **rnn_kwargs),
+            Conv2d(prev, prev := 96, kernel_size=3, stride=2, padding=1), LeakyReLU(0.2),
+            Conv2dGRU(prev, prev := hid2, **rnn_kwargs),
         )
 
         forecaster = Forecaster(
-            Conv2dSTLSTM(None, prev := hid2, **rnn_kwargs),
-            ConvTranspose2d(prev, prev := 32, kernel_size=4, stride=2, padding=1), LeakyReLU(0.2),
-            Conv2dSTLSTM(prev, prev := hid1, **rnn_kwargs),
-            ConvTranspose2d(prev, prev := 16, kernel_size=4, stride=2, padding=1), LeakyReLU(0.2),
-            Conv2dSTLSTM(prev, prev := hid0, **rnn_kwargs),
-            ConvTranspose2d(prev, prev := 16, kernel_size=3, stride=1, padding=1), LeakyReLU(0.2),
-            Conv2d(prev, prev := 16, kernel_size=3, stride=1, padding=1), LeakyReLU(0.2),
+            Conv2dGRU(None, prev := hid2, **rnn_kwargs),
+            ConvTranspose2d(prev, prev := 48, kernel_size=4, stride=2, padding=1), LeakyReLU(0.2),
+            Conv2dGRU(prev, prev := hid1, **rnn_kwargs),
+            ConvTranspose2d(prev, prev := 24, kernel_size=4, stride=2, padding=1), LeakyReLU(0.2),
+            Conv2dGRU(prev, prev := hid0, **rnn_kwargs),
+            ConvTranspose2d(prev, prev := 24, kernel_size=3, stride=1, padding=1), LeakyReLU(0.2),
+            Conv2d(prev, prev := 24, kernel_size=3, stride=1, padding=1), LeakyReLU(0.2),
             Conv2d(prev, C, kernel_size=1),
         )
-
         super().__init__(
             encoder, forecaster, *args,
             skip_channels=[hid0, hid1, hid2],
@@ -522,21 +447,15 @@ class PedPred_v4(EncoderForecaster):
 
     def forward(self, input, hidden=None, *, horizon=None):
         input = GridData(input).as_tensor('density', 'vel_mean', 'vel_var')
-        input = input.transpose(0, 1)   # [B,T,C,H,W] -> [T,B,C,H,W]
-
+        input = input.transpose(0, 1)
         output = super().forward(input, hidden, horizon=horizon)
-
         logdensity, vel_mean, vel_logvar = output.split((1, 2, 1), dim=-3)
-
-        # 物理边界截断
         logdensity = torch.clamp(logdensity, min=-20.0, max=10.0)
         vel_mean   = torch.clamp(vel_mean,   min=-15.0, max=15.0)
         vel_logvar = torch.clamp(vel_logvar, min=-20.0, max=5.0)
-
         output = GridData(logdensity=logdensity, vel_mean=vel_mean, vel_logvar=vel_logvar)
-        output = GridData(output.transpose(1, 0))   # [B,T,C,H,W] <- [T,B,C,H,W]
+        output = GridData(output.transpose(1, 0))
         return output
 
 
- # 接口完全兼容，直接替换
-PedPred3   = PedPred_v4
+PedPred3_gru_mid = PedPred_v11_grustack_mid

@@ -33,7 +33,7 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import List, Optional
 
 import numpy as np
 import torch
@@ -44,14 +44,7 @@ from .deps.enkf_sensors import GeneratePartialObs
 from .deps.observation_replay import _as_eval_tensor, load_replay_bundle
 from .deps.utils_plot import dump_step_arrays_npz, save_step_plot
 
-from .core import CrowdVarNet, load_frozen_pedpred  # noqa: E402
-
-
-def _load_meta(run_dir: Path) -> Dict[str, Any]:
-    p = run_dir / "training_meta.json"
-    if not p.is_file():
-        return {}
-    return json.loads(p.read_text(encoding="utf-8"))
+from .cli import build_model_from_ckpt
 
 
 def _history_tensor(
@@ -91,6 +84,12 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         default=None,
         help="覆盖 history 长度（默认 training_meta.nin 或 5）",
     )
+    p.add_argument(
+        "--rollout-warmup",
+        type=int,
+        default=None,
+        help="前 N 步用 GT 热身（对应 EnKF 的 initialize），之后 history 完全用自估 x̂；默认 = T_hist",
+    )
     args, rest = p.parse_known_args(argv if argv is not None else sys.argv[1:])
     sys.argv = [sys.argv[0]] + rest
     return args
@@ -110,16 +109,12 @@ def main(argv: Optional[List[str]] = None) -> None:
     os.makedirs(run_dir, exist_ok=True)
 
     cvn_path = Path(args.cvn_ckpt).resolve()
-    meta = _load_meta(cvn_path.parent)
-    T_hist = int(args.T_hist if args.T_hist is not None else meta.get("nin", 5))
-    n_iter = int(meta.get("n_iter", 8))
-    w_prior = float(meta.get("w_prior", 0.5))
-    rho_mask_thr = float(meta.get("rho_mask_thr", 0.05))
-    arch = str(meta.get("arch", "pedpred3"))
-    ped_path = meta.get("pedpred_ckpt")
-    if not ped_path:
-        raise SystemExit("training_meta.json 缺少 pedpred_ckpt")
-    ped_path = str(Path(ped_path).resolve())
+    model, meta = build_model_from_ckpt(
+        cvn_path,
+        device=device,
+        meta_overrides={"nin": args.T_hist} if args.T_hist is not None else None,
+    )
+    T_hist = int(model.T_hist)
 
     replay_bundle = load_replay_bundle(os.path.abspath(args.obs_replay_pkl))
     entries = replay_bundle["entries"]
@@ -140,20 +135,6 @@ def main(argv: Optional[List[str]] = None) -> None:
     }
     with open(os.path.join(run_dir, "compare_parameters.yaml"), "w", encoding="utf-8") as f:
         yaml.safe_dump(params_dump, f)
-
-    ped = load_frozen_pedpred(ped_path, device, arch=arch)
-    model = CrowdVarNet(
-        ped_pred=ped,
-        freeze_phi=True,
-        T_hist=T_hist,
-        n_iter=n_iter,
-        use_gru=False,
-        w_prior=w_prior,
-        rho_mask_thr=rho_mask_thr,
-    ).to(device)
-    payload = torch.load(cvn_path, map_location=device)
-    model.load_state_dict(payload["model_state_dict"], strict=True)
-    model.eval()
 
     gen = GeneratePartialObs(
         GRID_SIZE,
@@ -178,7 +159,14 @@ def main(argv: Optional[List[str]] = None) -> None:
     var_lst: List[float] = []
     times: List[float] = []
 
-    hist_frames: List[torch.Tensor] = []
+    hist_frames: List[torch.Tensor] = []      # GT 过去帧（仅用于 warmup；之后不再扩展）
+    est_frames: List[torch.Tensor] = []       # 自估过去帧（喂给 PedPred）
+    rollout_warmup = int(args.rollout_warmup) if args.rollout_warmup is not None else T_hist
+    print(
+        f"[mode] rollout-ONLY  warmup={rollout_warmup} "
+        f"(前 {rollout_warmup} 步用 GT 热身，之后 history 用自估 x̂ — 与 EnKF 条件对齐)",
+        flush=True,
+    )
     step_idx = 0
 
     for x_batch, _ in data:
@@ -214,12 +202,20 @@ def main(argv: Optional[List[str]] = None) -> None:
             obs_mask_np = (~np.isnan(partial_obs[0:1])).astype(np.float32)
             obs_np = true_hw * obs_mask_np
 
-            history = _history_tensor(hist_frames, T_hist, device, true_t.dtype)
+            if step_idx >= rollout_warmup:
+                # 公平对比：history 用自己过去估的 x̂，与 EnKF 条件对齐
+                src_frames = est_frames
+            else:
+                # warmup 阶段：用 GT（对应 EnKF 的 initialize）
+                src_frames = hist_frames
+            history = _history_tensor(src_frames, T_hist, device, true_t.dtype)
             obs = torch.from_numpy(obs_np).to(device=device, dtype=history.dtype).unsqueeze(0)
             obs_mask = torch.from_numpy(obs_mask_np).to(device=device, dtype=history.dtype).unsqueeze(0)
             x_gt = true_t.unsqueeze(0).to(device=device, dtype=history.dtype)
 
-            x_hat = model.forward(history, obs, obs_mask, x_gt)
+            x_hat = model.forward(history, obs, obs_mask)
+            # 保存当前步自估，供 rollout 模式下后续步使用
+            est_frames.append(x_hat[0].detach().clone())
             est = x_hat[0].detach().cpu().numpy().astype(np.float64).reshape(-1)
 
             spread = np.zeros(STATE_SHAPE, dtype=np.float64)
@@ -277,6 +273,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         "mean_step_time_s": float(np.mean(times)),
         "num_steps": int(len(rmse_list)),
         "T_hist": T_hist,
+        "rollout_warmup": int(rollout_warmup),
     }
     with open(os.path.join(run_dir, "compare_summary.json"), "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)

@@ -1,8 +1,10 @@
 """
 ATC corridor grid-cache dataloaders (same layout as ``partial_observation_experiments.train.get_data`` ATC branch).
 
-默认数据根目录为仓库内 ``data/ATC``（未设置 ``PEDPRED_ATC_DATA_DIR`` 时）。与教师对齐时用同一套
-``PEDPRED_ATC_SUBSET`` / ``PEDPRED_RESOLUTION`` / ``PEDPRED_PERIOD`` / ``PEDPRED_KERNEL``（见 ``sbatch/inc_atc_data_env.sh``）。
+未设置 ``PEDPRED_ATC_DATA_DIR`` 时，默认数据根为**仓库外**与 ``crowd_varnet`` 并列的
+``crowd_varnet_data/ATC``（可用环境变量 ``CROWD_VARNET_DATA_ROOT`` 改外部根路径）。
+与教师对齐时用同一套 ``PEDPRED_ATC_SUBSET`` / ``PEDPRED_RESOLUTION`` / ``PEDPRED_PERIOD`` / ``PEDPRED_KERNEL``
+（见 ``sbatch/inc_atc_data_env.sh``）。
 """
 from __future__ import annotations
 
@@ -20,9 +22,12 @@ from .grid_data import GridData
 
 
 def _default_atc_data_dir() -> Path:
-    """仓库根目录下 ``data/ATC``（与 ``PEDPRED_ATC_DATA_DIR`` 未设置时一致）。"""
-    root = Path(__file__).resolve().parents[2]
-    return root / "data" / "ATC"
+    """默认 ``<repo>/../crowd_varnet_data/ATC``；与 ``inc_atc_data_env.sh`` 中默认一致。"""
+    repo_root = Path(__file__).resolve().parents[2]
+    outside = os.environ.get("CROWD_VARNET_DATA_ROOT", "").strip()
+    if outside:
+        return Path(outside) / "ATC"
+    return repo_root.parent / "crowd_varnet_data" / "ATC"
 
 
 def _env_int(name: str, default: int) -> int:
@@ -157,27 +162,70 @@ def get_atc_data(
         raise ValueError(f"resolution={resolution!r} must yield integer grid scale factor")
 
     cache_dir = data_dir / "grid_cache"
-    all_readable = [
-        "atc-20121024.h5",
-        "atc-20121114.h5",
-        "atc-20121128.h5",
-        "atc-20121219.h5",
-        "atc-20130213.h5",
-        "atc-20130424.h5",
-    ]
-    file_splits = {
-        "train": all_readable[:4],
-        "valid": [all_readable[4]],
-        "test": [all_readable[5]],
+    # 优先：data_dir 下的 sunday_atc_{train,valid,test}.lst（新数据集格式）
+    # 否则：使用硬编码 6 文件 split（旧 crowd_varnet_data/ATC 兼容）
+    list_files = {
+        "train": data_dir / "sunday_atc_train.lst",
+        "valid": data_dir / "sunday_atc_valid.lst",
+        "test": data_dir / "sunday_atc_test.lst",
     }
+    use_lst_mode = all(p.is_file() for p in list_files.values())
 
-    def _cache_path(file_name: str) -> Path:
+    if use_lst_mode:
+        def _read_lst(p: Path) -> list[str]:
+            out = []
+            for line in p.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                # 取最后一段路径（兼容相对路径如 ATC/Sundays/atc-XXX.h5）
+                out.append(Path(line).name)
+            return out
+
+        file_splits = {
+            "train": _read_lst(list_files["train"]),
+            "valid": _read_lst(list_files["valid"]),
+            "test": _read_lst(list_files["test"]),
+        }
+    else:
+        all_readable = [
+            "atc-20121024.h5",
+            "atc-20121114.h5",
+            "atc-20121128.h5",
+            "atc-20121219.h5",
+            "atc-20130213.h5",
+            "atc-20130424.h5",
+        ]
+        file_splits = {
+            "train": all_readable[:4],
+            "valid": [all_readable[4]],
+            "test": [all_readable[5]],
+        }
+
+    def _cache_candidates(file_name: str) -> list[Path]:
+        """返回候选缓存路径列表（按优先顺序）：先新格式 ``{stem}_{subset}_{period}s.h5``，再老格式。"""
         stem = Path(file_name).stem
         subset_tag = subset or "default"
         kernel_tag = str(kernel).replace(":", "_")
         res_tag = str(resolution).replace(".", "p")
         period_tag = str(period).replace(".", "p")
-        return cache_dir / f"{stem}_{subset_tag}_r{res_tag}_p{period_tag}_k{kernel_tag}.h5"
+        # 新格式（用户提供 ``/scratch/work/zhangx29/data/grid_cache/atc-XXX_corridor_1.0s.h5``）
+        # 注：period 可能是 1.0（带零）或 1（整数），各试一遍
+        new_fmts = [
+            cache_dir / f"{stem}_{subset_tag}_{float(period):.1f}s.h5",
+            cache_dir / f"{stem}_{subset_tag}_{float(period):g}s.h5",
+        ]
+        # 老格式（仓库自建 cache）
+        old_fmt = cache_dir / f"{stem}_{subset_tag}_r{res_tag}_p{period_tag}_k{kernel_tag}.h5"
+        return [*new_fmts, old_fmt]
+
+    def _cache_path(file_name: str) -> Path:
+        """返回首个匹配的候选；若都不存在，返回老格式路径（让 _filter_files_with_cache 报缺失）。"""
+        cands = _cache_candidates(file_name)
+        for c in cands:
+            if c.is_file():
+                return c
+        return cands[-1]
 
     def _filter_files_with_cache(files: list[str], split_name: str) -> list[str]:
         out: list[str] = []

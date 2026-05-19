@@ -29,7 +29,7 @@ from typing import Any, Dict, Optional
 import numpy as np
 import torch
 
-from .core import PedPredAdapter, load_frozen_pedpred
+from .assimilation_model import FrozenPedPredPrior, load_frozen_pedpred
 from .deps.dataset_atc import get_atc_data
 from .deps.utils_plot import plot_generated_matrix_on_ax
 
@@ -130,7 +130,7 @@ def main(argv: Optional[list[str]] = None) -> None:
     nin = int(args.nin if args.nin is not None else os.environ.get("PEDPRED_NIN", "5"))
 
     phi = load_frozen_pedpred(args.checkpoint, device, arch=args.arch)
-    adapter = PedPredAdapter(phi, freeze=True).to(device)
+    adapter = FrozenPedPredPrior(phi, freeze=True).to(device)
     adapter.eval()
 
     loader = get_atc_data(

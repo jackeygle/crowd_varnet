@@ -21,7 +21,7 @@ import json
 import os
 import sys
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Optional
 
 import numpy as np
 import torch
@@ -29,7 +29,7 @@ import torch
 from .deps.dataset_atc import get_atc_data
 from .deps.utils_plot import plot_generated_matrix_on_ax
 
-from .core import CrowdVarNet, load_frozen_pedpred  # noqa: E402
+from .cli import build_model_from_ckpt
 from .train_cli import wrap_loader_varnet  # noqa: E402
 
 
@@ -104,11 +104,10 @@ def _save_step_plot_project_style(
     plt.close(fig)
 
 
-def _load_meta(run_dir: Path) -> Dict[str, Any]:
-    p = run_dir / "training_meta.json"
-    if not p.is_file():
-        return {}
-    return json.loads(p.read_text(encoding="utf-8"))
+def _load_meta(run_dir: Path) -> dict:
+    """已弃用；保留占位以兼容可能的外部 import。请改用 ``cli.load_training_meta``。"""
+    from .cli import load_training_meta
+    return load_training_meta(run_dir)
 
 
 def parse_args(argv: Optional[list] = None) -> argparse.Namespace:
@@ -154,33 +153,24 @@ def parse_args(argv: Optional[list] = None) -> argparse.Namespace:
 def main(argv: Optional[list] = None) -> None:
     args = parse_args(argv)
     ckpt_path = Path(args.ckpt).resolve()
-    run_dir = ckpt_path.parent
-    meta = _load_meta(run_dir)
     out_dir = Path(args.out_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
     device = torch.device(args.device)
 
-    default_nin = int(os.environ.get("PEDPRED_NIN", "5"))
-    nin = int(meta.get("nin", default_nin))
+    payload = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    model, meta = build_model_from_ckpt(
+        ckpt_path,
+        device=device,
+        meta_overrides={"rho_mask_thr": args.rho_mask_thr},
+    )
+    nin = int(model.T_hist)
+
     default_batch = int(os.environ.get("PEDPRED_BATCH", "16"))
     batch = int(meta.get("batch", default_batch)) if args.batch is None else int(args.batch)
-
     obs_mode = str(meta.get("obs_mode", "sensor"))
     sensing_range = float(meta.get("sensing_range", 5.0))
     num_agents = int(meta.get("num_agents", 3))
-    n_iter = int(meta.get("n_iter", 8))
-    w_prior = float(meta.get("w_prior", 0.5))
-    rho_mask_thr = (
-        float(args.rho_mask_thr)
-        if args.rho_mask_thr is not None
-        else float(meta.get("rho_mask_thr", 0.05))
-    )
-    arch = str(meta.get("arch", "pedpred3"))
-    ped_path = meta.get("pedpred_ckpt")
-    if not ped_path:
-        raise SystemExit("training_meta.json 缺少 pedpred_ckpt，无法加载 PedPred")
-    ped_path = str(Path(ped_path).resolve())
 
     nout = int(meta.get("nout", os.environ.get("PEDPRED_NOUT", "1")))
     val_loader = get_atc_data(
@@ -203,22 +193,6 @@ def main(argv: Optional[list] = None) -> None:
         shuffle=False,
         drop_last=False,
     )
-
-    ped = load_frozen_pedpred(ped_path, device, arch=arch)
-    payload = torch.load(ckpt_path, map_location=device)
-    # 自动检测 checkpoint 是否用 GRU 训练
-    use_gru = any("gru" in k for k in payload["model_state_dict"].keys())
-    model = CrowdVarNet(
-        ped_pred=ped,
-        freeze_phi=True,
-        T_hist=nin,
-        n_iter=n_iter,
-        use_gru=use_gru,
-        w_prior=w_prior,
-        rho_mask_thr=rho_mask_thr,
-    ).to(device)
-    model.load_state_dict(payload["model_state_dict"], strict=True)
-    model.eval()
 
     max_b = len(val_loader) if args.max_batches is None else min(len(val_loader), int(args.max_batches))
     print(
@@ -267,7 +241,7 @@ def main(argv: Optional[list] = None) -> None:
             )
 
         if args.viz_n > 0 and viz_saved < args.viz_n:
-            x_hat = model.forward(history, obs, obs_mask, x_gt)
+            x_hat = model.forward(history, obs, obs_mask)
             B = x_gt.shape[0]
             for i in range(B):
                 if viz_saved >= args.viz_n:

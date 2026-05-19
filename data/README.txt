@@ -1,21 +1,32 @@
-ATC 数据（独立部署）
-====================
+ATC 数据说明（CrowdVarNet）
+==========================
 
-目录约定::
+**默认（推荐）**：大数据放在**仓库外面**，与 ``crowd_varnet`` 并列::
 
-  data/ATC/grid_cache/<stem>_corridor_r<res>_p<period>_k<kernel>.h5
+  ../crowd_varnet_data/ATC/
+  ../crowd_varnet_data/ATC/grid_cache/*.h5
 
-其中 <stem> 为 dataset_atc.py 中列出的 atc-YYYYMMDD（与 train/valid/test 划分一致）。
-网格张量键名为 ``grid``，形状 [N, 4, H, W]。
+由 ``sbatch/inc_atc_data_env.sh`` 与 ``deps/dataset_atc.py`` 在未设置 ``PEDPRED_ATC_DATA_DIR`` 时
+自动使用该路径。外部根可用环境变量覆盖::
 
-从旧环境迁移::
+  export CROWD_VARNET_DATA_ROOT=/your/custom_data_root
+  # 则默认 ATC = ${CROWD_VARNET_DATA_ROOT}/ATC
 
-  mkdir -p data/ATC
-  rsync -a /path/to/old/pedpred/data/ATC/grid_cache/ data/ATC/grid_cache/
+或直接指定 ATC 根::
 
-或通过环境变量指向任意绝对路径::
+  export PEDPRED_ATC_DATA_DIR=/absolute/path/to/ATC
 
-  export PEDPRED_ATC_DATA_DIR=/your/atc/root
+**本目录** ``data/ATC/`` 仅作占位（``.gitkeep``）；可改为符号链接指向真实 ATC，或留空、完全依赖
+上面的外部目录 / 环境变量。
 
-生成 grid_cache 的「原始轨迹 → 栅格化」流水线若需完全自研，须保持上述命名规则与 H5 布局，
-或修改 crowd_varnet/deps/dataset_atc.py 中的 _cache_path / file_splits。
+目录与 cache 命名约定::
+
+  <ATC>/grid_cache/<stem>_corridor_r<res>_p<period>_k<kernel>.h5
+
+从旧环境迁移示例::
+
+  ln -sfn /path/to/project_analysis/.../data/ATC  /path/to/crowd_varnet_data/ATC
+
+或::
+
+  rsync -a /path/to/old/ATC/grid_cache/  ../crowd_varnet_data/ATC/grid_cache/

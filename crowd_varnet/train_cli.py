@@ -30,12 +30,9 @@ from torch.utils.data import ConcatDataset, DataLoader
 
 from .deps.dataset_atc import get_atc_data
 
-from .core import (  # noqa: E402
-    CrowdVarNet,
-    CrowdVarNetDataset,
-    load_frozen_pedpred,
-    train_one_epoch,
-)
+from .datasets import CrowdVarNetDataset
+from .models import CrowdVarNet, load_frozen_pedpred
+from .training import train_one_epoch
 
 
 def wrap_loader_varnet(
@@ -84,7 +81,12 @@ def wrap_loader_varnet(
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Train CrowdVarNet with frozen PedPred prior")
     p.add_argument("--checkpoint", type=str, required=True, help="PedPred .pth (key 'model')")
-    p.add_argument("--arch", type=str, default="pedpred3", choices=("pedpred", "pedpred2", "pedpred3"))
+    p.add_argument("--arch", type=str, default="pedpred3",
+                   choices=("pedpred", "pedpred2", "pedpred3", "pedpred3_wide", "pedpred3_xwide",
+                            "pedpred3_unet", "pedpred3_earth", "pedpred3_simvp",
+                            "pedpred3_convnext", "pedpred3_gru",
+                            "pedpred3_gru_mid", "pedpred3_gru_residual",
+                            "pedpred3_gru_mid_velresid"))
     p.add_argument("--epochs", type=int, default=10)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
@@ -139,7 +141,22 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         default=0.05,
         help="真值密度 > 该阈值视为「有密度」格点；loss/MSE 与 prior 项仅在这些格上平均（与观测项 vel 掩码一致）",
     )
-    p.add_argument("--use-gru", action="store_true", help="Use GRU spatial solver")
+    p.add_argument("--use-gru", action="store_true", help="[Deprecated] 等价 --solver-type gru")
+    p.add_argument(
+        "--solver-type",
+        type=str,
+        default=None,
+        choices=("scalar", "gru", "convgru"),
+        help="scalar: 标量步长（旧默认）; gru: per-pixel GRUCell; convgru: 共享空间 ConvGRU（推荐）",
+    )
+    p.add_argument("--solver-hidden", type=int, default=32, help="convgru 隐藏通道数")
+    p.add_argument(
+        "--solver-no-share",
+        action="store_true",
+        help="convgru 默认每步共享权重；加此 flag 改为每步独立权重（参数 ×n_iter）",
+    )
+    p.add_argument("--init-gate", action="store_true", help="启用可学习初值融合门")
+    p.add_argument("--init-gate-mid", type=int, default=16)
     p.add_argument("--train-workers", type=int, default=0)
     p.add_argument("--val-workers", type=int, default=0)
     p.add_argument(
@@ -206,6 +223,9 @@ def main(argv: Optional[List[str]] = None) -> None:
     )
 
     ped = load_frozen_pedpred(args.checkpoint, device, arch=args.arch)
+    solver_type = args.solver_type
+    if solver_type is None:
+        solver_type = "gru" if args.use_gru else "scalar"
     model = CrowdVarNet(
         ped_pred=ped,
         freeze_phi=True,
@@ -214,6 +234,11 @@ def main(argv: Optional[List[str]] = None) -> None:
         use_gru=args.use_gru,
         w_prior=args.w_prior,
         rho_mask_thr=float(args.rho_mask_thr),
+        solver_type=solver_type,
+        solver_hidden=args.solver_hidden,
+        solver_share=not args.solver_no_share,
+        init_gate=args.init_gate,
+        init_gate_mid=args.init_gate_mid,
     ).to(device)
 
     opt = Adam((p for p in model.parameters() if p.requires_grad), lr=args.lr)
@@ -242,6 +267,11 @@ def main(argv: Optional[List[str]] = None) -> None:
             "w_prior": args.w_prior,
             "log_interval": int(args.log_interval),
             "rho_mask_thr": float(args.rho_mask_thr),
+            "solver_type": solver_type,
+            "solver_hidden": int(args.solver_hidden),
+            "solver_share": not args.solver_no_share,
+            "init_gate": bool(args.init_gate),
+            "init_gate_mid": int(args.init_gate_mid),
         }
         (save_dir / "training_meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
 

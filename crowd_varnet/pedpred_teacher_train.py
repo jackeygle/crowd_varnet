@@ -1,11 +1,9 @@
 """
-PedPred teacher (ATC) training: NLLL (``Metrics``) or masked MSE (``physics_informed_loss``).
+PedPred teacher (ATC) training: NLLL only, gru_mid backbone only.
 
 Examples::
 
     python -u -m crowd_varnet.pedpred_teacher_train [--max-epochs N] [RESUME_GLOB]
-
-    PEDPRED_OBJECTIVE=physics_mse PEDPRED_LR=1e-4 python -u -m crowd_varnet.pedpred_teacher_train ...
 """
 from __future__ import annotations
 
@@ -23,29 +21,35 @@ from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
 from .deps.dataset_atc import get_atc_data
+from .deps.grid_data import GridData
 from .deps.pedpred_metrics import Metrics
-from .deps.pedpred_models import PedPred_v3, physics_informed_loss
+from .deps.pedpred_models import PedPred3_gru_mid
 from .deps.pedpred_train_utils import CatchSignal, cuda_context
 from .deps.pedpred_training_state import PedPredTeacherState
 from .pedpred_teacher_config import cfg
+
+
+def _maybe_flip_w(input, target, prob: float):
+    """以 ``prob`` 概率沿 W 轴翻转 (input, target)，并把 vx (vel_mean[0]) 取反。"""
+    if prob <= 0.0:
+        return input, target
+    if torch.rand(()).item() >= prob:
+        return input, target
+
+    def _flip(x):
+        t = GridData(x).as_tensor('density', 'vel_mean', 'vel_var')
+        t = torch.flip(t, dims=(-1,)).contiguous()
+        t[..., 1, :, :] = -t[..., 1, :, :]   # vx 取反
+        return GridData(t)
+
+    return _flip(input), _flip(target)
 
 loss_metric = cfg.loss
 
 
 def _use_physics() -> bool:
-    return cfg.objective == "physics_mse"
-
-
-def batch_physics_loss(pred, target):
-    pred_t = pred.as_tensor("logdensity", "vel_mean", "vel_logvar")
-    target_t = target.as_tensor("logdensity", "vel_mean", "vel_logvar")
-    return physics_informed_loss(
-        pred_t,
-        target_t,
-        cfg.physics_density_threshold,
-        w_den=cfg.physics_w_den,
-        w_vel=cfg.physics_w_vel,
-    )
+    """Always False — only NLLL is supported now (kept for legacy branches)."""
+    return False
 
 
 def scalar_training_loss(metrics: Metrics):
@@ -155,10 +159,25 @@ class EDException(Exception):
 
 
 def get_trainstate(file_glob, live_cfg):
-    model = PedPred_v3()
+    arch = os.environ.get("PEDPRED_ARCH", "pedpred3_gru_mid").lower().strip()
+    if arch != "pedpred3_gru_mid":
+        raise ValueError(
+            f"PEDPRED_ARCH must be 'pedpred3_gru_mid' (only supported arch), got {arch!r}"
+        )
+    model = PedPred3_gru_mid()
+    n_params = sum(p.numel() for p in model.parameters())
+    print(f"[get_trainstate] arch={arch} total_params={n_params:,}", flush=True)
     if torch.cuda.is_available():
         model = model.cuda()
-    optimizer = optim.Adam(model.parameters(), lr=cfg.lr, betas=(0.9, 0.999), amsgrad=True)
+    wd = float(getattr(cfg, "weight_decay", 0.0))
+    if wd > 0:
+        optimizer = optim.AdamW(model.parameters(), lr=cfg.lr, betas=(0.9, 0.999),
+                                amsgrad=True, weight_decay=wd)
+        opt_name = "AdamW"
+    else:
+        optimizer = optim.Adam(model.parameters(), lr=cfg.lr, betas=(0.9, 0.999), amsgrad=True)
+        opt_name = "Adam"
+    print(f"[get_trainstate] optimizer={opt_name} lr={cfg.lr} wd={wd:.2e}", flush=True)
     lr_scheduler = ReduceLROnPlateau(optimizer, factor=0.5, patience=10, cooldown=0, threshold=0)
     return PedPredTeacherState(
         file_glob,
@@ -182,6 +201,7 @@ def train(state: PedPredTeacherState, data: DataLoader):
     decomp_phy_vy = []
     data = tqdm(data, desc=f"{state.name} training, epoch {state.epochs:,}")
     for _, (input, target) in enumerate(data):
+        input, target = _maybe_flip_w(input, target, getattr(cfg, "flip_w_prob", 0.0))
         input = input.to(model_device)
         target = target.to(model_device)
         pred = state.model(input, horizon=target.shape[1])
@@ -198,7 +218,7 @@ def train(state: PedPredTeacherState, data: DataLoader):
             continue
         loss.backward()
         if _use_physics():
-            grad_norm = clip_grad_norm_(state.model.parameters(), max_norm=1.0)
+            grad_norm = clip_grad_norm_(state.model.parameters(), max_norm=0.5)
         else:
             clip_grad_value_(state.model.parameters(), 1e3)
             grad_norm = clip_grad_norm_(state.model.parameters(), 1)
@@ -468,12 +488,23 @@ def fit(file_glob=None, max_epochs: int = 15):
     print(
         f"[pedpred_teacher_train] objective={cfg.objective} lr={cfg.lr} "
         f"(physics threshold={cfg.physics_density_threshold} w_den/w_vel/w_var="
-        f"{cfg.physics_w_den}/{cfg.physics_w_vel}/{cfg.physics_w_var})",
+        f"{cfg.physics_w_den}/{cfg.physics_w_vel}/{cfg.physics_w_var}) "
+        f"weight_decay={getattr(cfg,'weight_decay',0.0)} "
+        f"flip_w_prob={getattr(cfg,'flip_w_prob',0.0)} "
+        f"early_stop_patience={getattr(cfg,'early_stop_patience',0)}",
         flush=True,
     )
+    patience = int(getattr(cfg, "early_stop_patience", 0))
     with cuda_context():
-        data = get_teacher_data("train", "valid", pin_memory=False)
+        data = get_teacher_data(
+            "train", "valid",
+            num_workers=int(os.environ.get("PEDPRED_NUM_WORKERS", "8")),
+            pin_memory=True,
+            prefetch_factor=int(os.environ.get("PEDPRED_PREFETCH", "4")),
+        )
         state = get_trainstate(file_glob, live_cfg=cfg)
+        best_val = float("inf")
+        epochs_since_best = 0
         try:
             with CatchSignal() as stop:
                 while not stop:
@@ -483,6 +514,24 @@ def fit(file_glob=None, max_epochs: int = 15):
                     try:
                         train(state, data.train)
                         validate(state, data.valid, loss_metric)
+                        cur_val = float(state.loss)
+                        if cur_val < best_val - 1e-6:
+                            best_val = cur_val
+                            epochs_since_best = 0
+                        else:
+                            epochs_since_best += 1
+                            print(
+                                f"[early-stop] no-improve {epochs_since_best}/{patience} "
+                                f"(cur_val={cur_val:.6f} best={best_val:.6f})",
+                                flush=True,
+                            )
+                            if patience > 0 and epochs_since_best >= patience:
+                                print(
+                                    f"[early-stop] triggered at epoch {state.epochs} "
+                                    f"(no improve for {patience} epochs)",
+                                    flush=True,
+                                )
+                                break
                     except EDException as e:
                         print(e)
                         state = get_trainstate(file_glob, live_cfg=cfg)
