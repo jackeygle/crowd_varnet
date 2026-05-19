@@ -30,7 +30,7 @@ from .deps.dataset_atc import get_atc_data
 from .deps.utils_plot import plot_generated_matrix_on_ax
 
 from .cli import build_model_from_ckpt
-from .train_cli import wrap_loader_varnet  # noqa: E402
+from .cli import wrap_loader_varnet  # noqa: E402
 
 
 def _partial_obs_as_nan(

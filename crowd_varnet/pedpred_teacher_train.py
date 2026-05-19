@@ -1,5 +1,5 @@
 """
-PedPred teacher (ATC) training: NLLL only, gru_mid backbone only.
+PedPred teacher (ATC) training: NLLL only, pedpred3_gru_mid backbone only.
 
 Examples::
 
@@ -30,7 +30,7 @@ from .pedpred_teacher_config import cfg
 
 
 def _maybe_flip_w(input, target, prob: float):
-    """以 ``prob`` 概率沿 W 轴翻转 (input, target)，并把 vx (vel_mean[0]) 取反。"""
+    """Flip (input, target) along the W axis with probability ``prob``; vx (vel_mean[0]) is negated."""
     if prob <= 0.0:
         return input, target
     if torch.rand(()).item() >= prob:
@@ -44,12 +44,8 @@ def _maybe_flip_w(input, target, prob: float):
 
     return _flip(input), _flip(target)
 
+
 loss_metric = cfg.loss
-
-
-def _use_physics() -> bool:
-    """Always False — only NLLL is supported now (kept for legacy branches)."""
-    return False
 
 
 def scalar_training_loss(metrics: Metrics):
@@ -74,18 +70,8 @@ def batch_loss_and_decomp(pred, target):
     return loss, den, vel, vel_x, vel_y
 
 
-def _fmt_physics_postfix(
-    loss, mse_den: float, mse_vel: float, mse_vx: float, mse_vy: float, mse_cont: float
-) -> str:
-    L = float(loss.detach())
-    return (
-        f"L={L:.4f} den={mse_den:.4f} vel={mse_vel:.4f} "
-        f"vx={mse_vx:.4f} vy={mse_vy:.4f} cont={mse_cont:.4f}"
-    )
-
-
 def _fmt_nlll_postfix(loss, den, vel, vel_x, vel_y) -> str:
-    """L_vel = vel_est+vel_unc (weighted mean); L_velx/L_vely split only the vel_est part (ch0/ch1 of vel_mean)."""
+    """L_vel = vel_est+vel_unc (weighted mean); L_velx/L_vely split only the vel_est part."""
     L = float(loss.detach())
     d = float(den.detach())
     v = float(vel.detach())
@@ -196,49 +182,32 @@ def train(state: PedPredTeacherState, data: DataLoader):
     decomp_vel = []
     decomp_vel_x = []
     decomp_vel_y = []
-    decomp_cont = []
-    decomp_phy_vx = []
-    decomp_phy_vy = []
     data = tqdm(data, desc=f"{state.name} training, epoch {state.epochs:,}")
     for _, (input, target) in enumerate(data):
         input, target = _maybe_flip_w(input, target, getattr(cfg, "flip_w_prob", 0.0))
         input = input.to(model_device)
         target = target.to(model_device)
         pred = state.model(input, horizon=target.shape[1])
-        if _use_physics():
-            loss, mse_d, mse_v, mse_vx, mse_vy, mse_cont = batch_physics_loss(pred, target)
-            data.set_postfix_str(_fmt_physics_postfix(loss, mse_d, mse_v, mse_vx, mse_vy, mse_cont))
-        else:
-            loss, den_t, vel_t, vx_t, vy_t = batch_loss_and_decomp(pred, target)
-            data.set_postfix_str(_fmt_nlll_postfix(loss, den_t, vel_t, vx_t, vy_t))
+        loss, den_t, vel_t, vx_t, vy_t = batch_loss_and_decomp(pred, target)
+        data.set_postfix_str(_fmt_nlll_postfix(loss, den_t, vel_t, vx_t, vy_t))
         if not loss.isfinite():
             if state.steps < 18:
                 raise EDException(name=state.name, age=state.steps, cause=f"{loss=:g}")
             print(f"!!! {loss=:g}, skipping iteration")
             continue
         loss.backward()
-        if _use_physics():
-            grad_norm = clip_grad_norm_(state.model.parameters(), max_norm=0.5)
-        else:
-            clip_grad_value_(state.model.parameters(), 1e3)
-            grad_norm = clip_grad_norm_(state.model.parameters(), 1)
+        clip_grad_value_(state.model.parameters(), 1e3)
+        grad_norm = clip_grad_norm_(state.model.parameters(), 1)
         if not grad_norm.isfinite():
             if state.steps < 18:
                 raise EDException(name=state.name, age=state.steps, cause=f"{grad_norm=:g}")
             print(f"!!! {grad_norm=:g}, skipping iteration")
             continue
         losses.append(float(loss.detach()))
-        if _use_physics():
-            decomp_den.append(mse_d)
-            decomp_vel.append(mse_v)
-            decomp_cont.append(mse_cont)
-            decomp_phy_vx.append(mse_vx)
-            decomp_phy_vy.append(mse_vy)
-        else:
-            decomp_den.append(float(den_t.detach()))
-            decomp_vel.append(float(vel_t.detach()))
-            decomp_vel_x.append(float(vx_t.detach()))
-            decomp_vel_y.append(float(vy_t.detach()))
+        decomp_den.append(float(den_t.detach()))
+        decomp_vel.append(float(vel_t.detach()))
+        decomp_vel_x.append(float(vx_t.detach()))
+        decomp_vel_y.append(float(vy_t.detach()))
         state.writer.add_scalar("train iteration loss", loss.detach(), state.steps)
         state.writer.add_scalar("grad norm", grad_norm, state.steps)
         state.optimizer.step()
@@ -246,67 +215,32 @@ def train(state: PedPredTeacherState, data: DataLoader):
         state.steps += 1
     loss = sum(losses) / len(losses)
     state.writer.add_scalar("training loss", loss, state.steps)
-    ad = av = avx = avy = avr = apvx = apvy = None
     if decomp_den:
         ad = sum(decomp_den) / len(decomp_den)
         av = sum(decomp_vel) / len(decomp_vel)
-        if _use_physics():
-            acont = sum(decomp_cont) / len(decomp_cont)
-            apvx = sum(decomp_phy_vx) / len(decomp_phy_vx)
-            apvy = sum(decomp_phy_vy) / len(decomp_phy_vy)
-            state.writer.add_scalars(
-                "training loss decomposition (epoch mean)",
-                {
-                    "mse_density": ad,
-                    "mse_velocity_masked": av,
-                    "mse_velocity_vx_masked": apvx,
-                    "mse_velocity_vy_masked": apvy,
-                    "continuity": acont,
-                },
-                state.steps,
-            )
-            data.set_postfix_str(
-                f"mean L={loss:.4f} den={ad:.4f} vel={av:.4f} vx={apvx:.4f} vy={apvy:.4f} cont={acont:.4f}"
-            )
-            print(
-                f"[train epoch {state.epochs}] objective=physics_mse mse_den={ad:.4f} mse_vel={av:.4f} "
-                f"mse_vx={apvx:.4f} mse_vy={apvy:.4f} mse_cont={acont:.4f} L_total={loss:.4f}",
-                flush=True,
-            )
-            save_loss_to_file(
-                state,
-                loss,
-                is_training=True,
-                l_den=ad,
-                l_vel=av,
-                l_vel_x=None,
-                l_vel_y=None,
-                l_var=avr,
-                phy_mse_vx=apvx,
-                phy_mse_vy=apvy,
-            )
-        else:
-            vel_scale = cfg.loss_vel_scale if loss_metric == "mean total weighted NLLL" else 1.0
-            avx = sum(decomp_vel_x) / len(decomp_vel_x)
-            avy = sum(decomp_vel_y) / len(decomp_vel_y)
-            state.writer.add_scalars(
-                "training loss decomposition (epoch mean)",
-                {
-                    "density": ad,
-                    "velocity": av,
-                    "velocity x loss_vel_scale": av * vel_scale,
-                    "vel_est_vx": avx,
-                    "vel_est_vy": avy,
-                },
-                state.steps,
-            )
-            data.set_postfix_str(f"mean L={loss:.3f} den={ad:.3f} vel={av:+.3f} velx={avx:+.3f} vely={avy:+.3f}")
-            print(
-                f"[train epoch {state.epochs}] L_den={ad:.4f} L_vel={av:+.4f} "
-                f"L_vel_est_vx={avx:+.4f} L_vel_est_vy={avy:+.4f} L_total={loss:.4f}",
-                flush=True,
-            )
-            save_loss_to_file(state, loss, is_training=True, l_den=ad, l_vel=av, l_vel_x=avx, l_vel_y=avy)
+        avx = sum(decomp_vel_x) / len(decomp_vel_x)
+        avy = sum(decomp_vel_y) / len(decomp_vel_y)
+        vel_scale = cfg.loss_vel_scale if loss_metric == "mean total weighted NLLL" else 1.0
+        state.writer.add_scalars(
+            "training loss decomposition (epoch mean)",
+            {
+                "density": ad,
+                "velocity": av,
+                "velocity x loss_vel_scale": av * vel_scale,
+                "vel_est_vx": avx,
+                "vel_est_vy": avy,
+            },
+            state.steps,
+        )
+        data.set_postfix_str(
+            f"mean L={loss:.3f} den={ad:.3f} vel={av:+.3f} velx={avx:+.3f} vely={avy:+.3f}"
+        )
+        print(
+            f"[train epoch {state.epochs}] L_den={ad:.4f} L_vel={av:+.4f} "
+            f"L_vel_est_vx={avx:+.4f} L_vel_est_vy={avy:+.4f} L_total={loss:.4f}",
+            flush=True,
+        )
+        save_loss_to_file(state, loss, is_training=True, l_den=ad, l_vel=av, l_vel_x=avx, l_vel_y=avy)
     else:
         data.set_postfix_str(f"mean L={loss:.3f}")
         save_loss_to_file(state, loss, is_training=True)
@@ -329,40 +263,27 @@ def validate(state: PedPredTeacherState, data: DataLoader, loss_metric_name: str
         val_decomp_vel = []
         val_decomp_vel_x = []
         val_decomp_vel_y = []
-        val_decomp_cont = []
-        val_decomp_phy_vx = []
-        val_decomp_phy_vy = []
         data = tqdm(data, desc=f"{state.name} validating, epoch {state.epochs:,}")
         for i, (input, target) in enumerate(data):
             input = input.to(model_device)
             target = target.to(model_device)
             pred = state.model(input, horizon=target.shape[1])
-            if _use_physics():
-                loss, mse_d, mse_v, mse_vx, mse_vy, mse_cont = batch_physics_loss(pred, target)
-                data.set_postfix_str(_fmt_physics_postfix(loss, mse_d, mse_v, mse_vx, mse_vy, mse_cont))
-                losses.append(loss)
-                val_decomp_den.append(mse_d)
-                val_decomp_vel.append(mse_v)
-                val_decomp_cont.append(mse_cont)
-                val_decomp_phy_vx.append(mse_vx)
-                val_decomp_phy_vy.append(mse_vy)
-            else:
-                metrics = Metrics(pred, target)
-                loss = scalar_training_loss(metrics)
-                den_v = metrics["mean NLLL density"]
-                vel_v = metrics["mean weighted NLLL vel_est"] + metrics["mean weighted NLLL vel_unc"]
-                vx_v = metrics["mean weighted NLLL vel_est_vx"]
-                vy_v = metrics["mean weighted NLLL vel_est_vy"]
-                data.set_postfix_str(_fmt_nlll_postfix(loss, den_v, vel_v, vx_v, vy_v))
-                losses.append(loss)
-                val_decomp_den.append(float(metrics["mean NLLL density"]))
-                val_decomp_vel.append(
-                    float(metrics["mean weighted NLLL vel_est"] + metrics["mean weighted NLLL vel_unc"])
-                )
-                val_decomp_vel_x.append(float(metrics["mean weighted NLLL vel_est_vx"]))
-                val_decomp_vel_y.append(float(metrics["mean weighted NLLL vel_est_vy"]))
-                for metric in metrics.scalars:
-                    all_metrics[metric].append(metrics[metric])
+            metrics = Metrics(pred, target)
+            loss = scalar_training_loss(metrics)
+            den_v = metrics["mean NLLL density"]
+            vel_v = metrics["mean weighted NLLL vel_est"] + metrics["mean weighted NLLL vel_unc"]
+            vx_v = metrics["mean weighted NLLL vel_est_vx"]
+            vy_v = metrics["mean weighted NLLL vel_est_vy"]
+            data.set_postfix_str(_fmt_nlll_postfix(loss, den_v, vel_v, vx_v, vy_v))
+            losses.append(loss)
+            val_decomp_den.append(float(metrics["mean NLLL density"]))
+            val_decomp_vel.append(
+                float(metrics["mean weighted NLLL vel_est"] + metrics["mean weighted NLLL vel_unc"])
+            )
+            val_decomp_vel_x.append(float(metrics["mean weighted NLLL vel_est_vx"]))
+            val_decomp_vel_y.append(float(metrics["mean weighted NLLL vel_est_vy"]))
+            for metric in metrics.scalars:
+                all_metrics[metric].append(metrics[metric])
             if i in range(0, max(len(data), 1), max(len(data) // 8, 1)):
                 if state.epochs == 1:
                     state.writer.add_figure(f"plot input/{i}", input[0].plot(), state.steps)
@@ -370,75 +291,40 @@ def validate(state: PedPredTeacherState, data: DataLoader, loss_metric_name: str
                 state.writer.add_figure(f"plot prediction/{i}", pred[0].plot(), state.steps)
         loss = sum(losses) / len(losses)
         state.writer.add_scalar("validation loss", loss, state.steps)
-        v_den = v_vel = v_vel_x = v_vel_y = v_var = vpvx = vpvy = None
         if val_decomp_den:
             v_den = sum(val_decomp_den) / len(val_decomp_den)
             v_vel = sum(val_decomp_vel) / len(val_decomp_vel)
-            if _use_physics():
-                v_cont = sum(val_decomp_cont) / len(val_decomp_cont)
-                vpvx = sum(val_decomp_phy_vx) / len(val_decomp_phy_vx)
-                vpvy = sum(val_decomp_phy_vy) / len(val_decomp_phy_vy)
-                state.writer.add_scalars(
-                    "validation loss decomposition (epoch mean)",
-                    {
-                        "mse_density": v_den,
-                        "mse_velocity_masked": v_vel,
-                        "mse_velocity_vx_masked": vpvx,
-                        "mse_velocity_vy_masked": vpvy,
-                        "continuity": v_cont,
-                    },
-                    state.steps,
-                )
-                print(
-                    f"[valid epoch {state.epochs}] objective=physics_mse mse_den={v_den:.4f} mse_vel={v_vel:.4f} "
-                    f"mse_vx={vpvx:.4f} mse_vy={vpvy:.4f} mse_cont={v_cont:.4f} L_total={loss:.4f}",
-                    flush=True,
-                )
-                save_loss_to_file(
-                    state,
-                    loss,
-                    is_training=False,
-                    l_den=v_den,
-                    l_vel=v_vel,
-                    l_vel_x=None,
-                    l_vel_y=None,
-                    l_var=v_var,
-                    phy_mse_vx=vpvx,
-                    phy_mse_vy=vpvy,
-                )
-            else:
-                v_vel_x = sum(val_decomp_vel_x) / len(val_decomp_vel_x)
-                v_vel_y = sum(val_decomp_vel_y) / len(val_decomp_vel_y)
-                v_scale = cfg.loss_vel_scale if loss_metric_name == "mean total weighted NLLL" else 1.0
-                state.writer.add_scalars(
-                    "validation loss decomposition (epoch mean)",
-                    {
-                        "density": v_den,
-                        "velocity": v_vel,
-                        "velocity x loss_vel_scale": v_vel * v_scale,
-                        "vel_est_vx": v_vel_x,
-                        "vel_est_vy": v_vel_y,
-                    },
-                    state.steps,
-                )
-                print(
-                    f"[valid epoch {state.epochs}] L_den={v_den:.4f} L_vel={v_vel:+.4f} "
-                    f"L_vel_est_vx={v_vel_x:+.4f} L_vel_est_vy={v_vel_y:+.4f} L_total={loss:.4f}",
-                    flush=True,
-                )
-                save_loss_to_file(
-                    state,
-                    loss,
-                    is_training=False,
-                    l_den=v_den,
-                    l_vel=v_vel,
-                    l_vel_x=v_vel_x,
-                    l_vel_y=v_vel_y,
-                )
-        if not _use_physics():
-            for metric, values in all_metrics.items():
-                value = sum(values) / len(values)
-                state.writer.add_scalar(f"{metric}", value, state.steps)
+            v_vel_x = sum(val_decomp_vel_x) / len(val_decomp_vel_x)
+            v_vel_y = sum(val_decomp_vel_y) / len(val_decomp_vel_y)
+            v_scale = cfg.loss_vel_scale if loss_metric_name == "mean total weighted NLLL" else 1.0
+            state.writer.add_scalars(
+                "validation loss decomposition (epoch mean)",
+                {
+                    "density": v_den,
+                    "velocity": v_vel,
+                    "velocity x loss_vel_scale": v_vel * v_scale,
+                    "vel_est_vx": v_vel_x,
+                    "vel_est_vy": v_vel_y,
+                },
+                state.steps,
+            )
+            print(
+                f"[valid epoch {state.epochs}] L_den={v_den:.4f} L_vel={v_vel:+.4f} "
+                f"L_vel_est_vx={v_vel_x:+.4f} L_vel_est_vy={v_vel_y:+.4f} L_total={loss:.4f}",
+                flush=True,
+            )
+            save_loss_to_file(
+                state,
+                loss,
+                is_training=False,
+                l_den=v_den,
+                l_vel=v_vel,
+                l_vel_x=v_vel_x,
+                l_vel_y=v_vel_y,
+            )
+        for metric, values in all_metrics.items():
+            value = sum(values) / len(values)
+            state.writer.add_scalar(f"{metric}", value, state.steps)
         if state.lr_scheduler is not None:
             if isinstance(state.lr_scheduler, ReduceLROnPlateau):
                 state.lr_scheduler.step(loss)
@@ -461,8 +347,6 @@ def save_loss_to_file(
     l_vel_x: float | None = None,
     l_vel_y: float | None = None,
     l_var: float | None = None,
-    phy_mse_vx: float | None = None,
-    phy_mse_vy: float | None = None,
 ):
     log_file = os.path.join(state.dir, "loss_log.txt")
     mode = "a" if os.path.exists(log_file) else "w"
@@ -474,8 +358,6 @@ def save_loss_to_file(
             extra += f" vel={l_vel:+.6f}"
         if l_var is not None:
             extra += f" var={l_var:.6f}"
-        if phy_mse_vx is not None and phy_mse_vy is not None:
-            extra += f" phy_mse_vx={phy_mse_vx:.6f} phy_mse_vy={phy_mse_vy:.6f}"
         if l_vel_x is not None and l_vel_y is not None:
             extra += f" vel_est_vx={l_vel_x:+.6f} vel_est_vy={l_vel_y:+.6f}"
         if is_training:
@@ -486,9 +368,7 @@ def save_loss_to_file(
 
 def fit(file_glob=None, max_epochs: int = 15):
     print(
-        f"[pedpred_teacher_train] objective={cfg.objective} lr={cfg.lr} "
-        f"(physics threshold={cfg.physics_density_threshold} w_den/w_vel/w_var="
-        f"{cfg.physics_w_den}/{cfg.physics_w_vel}/{cfg.physics_w_var}) "
+        f"[pedpred_teacher_train] objective=nlll lr={cfg.lr} "
         f"weight_decay={getattr(cfg,'weight_decay',0.0)} "
         f"flip_w_prob={getattr(cfg,'flip_w_prob',0.0)} "
         f"early_stop_patience={getattr(cfg,'early_stop_patience',0)}",

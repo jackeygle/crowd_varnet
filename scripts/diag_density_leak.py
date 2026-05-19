@@ -23,7 +23,7 @@ import torch
 # 复用 infer_cli 的 wrap 逻辑
 from crowd_varnet.cli import build_model_from_ckpt
 from crowd_varnet.deps.dataset_atc import get_atc_data
-from crowd_varnet.train_cli import wrap_loader_varnet
+from crowd_varnet.cli import wrap_loader_varnet
 
 
 def main() -> None:

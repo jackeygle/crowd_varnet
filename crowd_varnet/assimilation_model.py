@@ -34,7 +34,7 @@ from .models import (
     load_frozen_pedpred,
     masked_mean_sq,
 )
-from .training import rollout_tbptt_epoch, rollout_val_loss, train_one_epoch
+from .training import rollout_tbptt_epoch, rollout_val_loss
 
 # 旧名别名（checkpoint 子模块名 ``adapter`` / ``solver`` 不受影响）
 PedPredAdapter = FrozenPedPredPrior
@@ -96,6 +96,5 @@ __all__ = [
     "spatial_sensor_mask",
     "stack_grid_sequence",
     "target_frame_index_in_episode",
-    "train_one_epoch",
     "unwrap_concat_base_dataset",
 ]

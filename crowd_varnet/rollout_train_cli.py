@@ -74,12 +74,9 @@ def _build_rollout_loader(
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Train CrowdVarNet via full-rollout TBPTT")
     p.add_argument("--checkpoint", type=str, required=True, help="PedPred .pth / .hkl")
-    p.add_argument("--arch", type=str, default="pedpred3",
-                   choices=("pedpred", "pedpred2", "pedpred3", "pedpred3_wide", "pedpred3_xwide",
-                            "pedpred3_unet", "pedpred3_earth", "pedpred3_simvp",
-                            "pedpred3_convnext", "pedpred3_gru",
-                            "pedpred3_gru_mid", "pedpred3_gru_residual",
-                            "pedpred3_gru_mid_velresid"))
+    p.add_argument("--arch", type=str, default="pedpred3_gru_mid",
+                   choices=("pedpred3_gru_mid",),
+                   help="Only pedpred3_gru_mid is supported (final v13 teacher).")
     p.add_argument("--warmstart", type=str, default=None, help="既有 CrowdVarNet best.pt，继续训")
     p.add_argument("--epochs", type=int, default=10)
     p.add_argument("--lr", type=float, default=5e-4)
@@ -94,24 +91,20 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--n-iter", type=int, default=8)
     p.add_argument("--w-prior", type=float, default=0.5)
     p.add_argument("--rho-mask-thr", type=float, default=0.05)
-    p.add_argument("--use-gru", action="store_true", help="[Deprecated] 等价 --solver-type gru")
-    p.add_argument("--gru-ch", type=int, default=16)
     p.add_argument(
         "--solver-type",
         type=str,
-        default=None,
-        choices=("scalar", "gru", "convgru"),
-        help="scalar: 标量步长（旧默认）; gru: per-pixel GRUCell; convgru: 共享空间 ConvGRU（推荐）",
+        default="convgru",
+        choices=("convgru",),
+        help="Only convgru solver is supported (final winning combo).",
     )
-    p.add_argument("--solver-hidden", type=int, default=32, help="convgru 隐藏通道数")
-    p.add_argument("--solver-kernel", type=int, default=3, help="convgru 卷积核大小（默认3，推荐7扩大感受野）")
+    p.add_argument("--solver-hidden", type=int, default=256, help="convgru 隐藏通道数")
+    p.add_argument("--solver-kernel", type=int, default=3, help="convgru 卷积核大小")
     p.add_argument(
         "--solver-no-share",
         action="store_true",
         help="convgru 默认每步共享权重；加此 flag 改为每步独立权重（参数 ×n_iter）",
     )
-    p.add_argument("--init-gate", action="store_true", help="启用可学习初值融合门")
-    p.add_argument("--init-gate-mid", type=int, default=16)
     p.add_argument("--train-workers", type=int, default=0)
     p.add_argument("--val-workers", type=int, default=0)
     p.add_argument("--save-dir", type=str, default=None)
@@ -197,9 +190,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     )
 
     ped = load_frozen_pedpred(args.checkpoint, device, arch=args.arch)
-    solver_type = args.solver_type
-    if solver_type is None:
-        solver_type = "gru" if args.use_gru else "scalar"
+    solver_type = args.solver_type  # only "convgru" is allowed by argparse
     ch_weights = tuple(args.ch_weights) if args.ch_weights else (2.5, 1.5, 1.0, 0.5)
     print(f"[rollout-train] ch_weights = {ch_weights}", flush=True)
     model = CrowdVarNet(
@@ -207,8 +198,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         freeze_phi=True,
         T_hist=T_hist,
         n_iter=args.n_iter,
-        use_gru=args.use_gru,
-        gru_ch=args.gru_ch,
+        use_gru=False,
         w_prior=args.w_prior,
         ch_weights=ch_weights,
         rho_mask_thr=float(args.rho_mask_thr),
@@ -217,8 +207,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         solver_kernel=args.solver_kernel,
         solver_share=not args.solver_no_share,
         solver_dropout=float(args.solver_dropout),
-        init_gate=args.init_gate,
-        init_gate_mid=args.init_gate_mid,
+        init_gate=False,
         unfreeze_phi_tail=int(args.unfreeze_phi_tail),
     ).to(device)
 
@@ -311,14 +300,10 @@ def main(argv: Optional[List[str]] = None) -> None:
             "n_iter": args.n_iter,
             "w_prior": args.w_prior,
             "rho_mask_thr": args.rho_mask_thr,
-            "use_gru": bool(args.use_gru),
-            "gru_ch": args.gru_ch,
             "solver_type": solver_type,
             "solver_hidden": int(args.solver_hidden),
             "solver_kernel": int(args.solver_kernel),
             "solver_share": not args.solver_no_share,
-            "init_gate": bool(args.init_gate),
-            "init_gate_mid": int(args.init_gate_mid),
             "solver_dropout": float(args.solver_dropout),
             "weight_decay": float(args.weight_decay),
             "ema_decay": float(args.ema_decay),

@@ -6,8 +6,57 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Tuple, Union
 
 import torch
+from torch.utils.data import ConcatDataset, DataLoader
 
+from ..datasets import CrowdVarNetDataset
 from ..models import CrowdVarNet, load_frozen_pedpred
+
+
+def wrap_loader_varnet(
+    loader: DataLoader,
+    seed: int,
+    *,
+    obs_mode: str = "sensor",
+    partial_frac: float = 0.35,
+    sensing_range: float = 5.0,
+    num_agents: int = 3,
+    batch_size: Optional[int] = None,
+    num_workers: Optional[int] = None,
+    shuffle: Optional[bool] = None,
+    drop_last: Optional[bool] = None,
+) -> DataLoader:
+    """Re-wrap an ATC base ``DataLoader`` so that each item yields the tuple
+    ``(history, obs, obs_mask, x_gt)`` expected by ``CrowdVarNet`` for single-step
+    inference / evaluation. Used by ``infer_cli`` and ``scripts/diag_density_leak.py``.
+    """
+    base_ds = loader.dataset
+    ds_kw = dict(
+        obs_mode=obs_mode,
+        partial_frac=partial_frac,
+        sensing_range=sensing_range,
+        num_agents=num_agents,
+    )
+    if isinstance(base_ds, ConcatDataset):
+        wrapped = ConcatDataset(
+            [CrowdVarNetDataset(ds, seed=seed + i, **ds_kw) for i, ds in enumerate(base_ds.datasets)]
+        )
+    else:
+        wrapped = CrowdVarNetDataset(base_ds, seed=seed, **ds_kw)
+
+    nw = num_workers if num_workers is not None else loader.num_workers
+    dl_kw: dict = dict(
+        dataset=wrapped,
+        batch_size=batch_size if batch_size is not None else loader.batch_size,
+        shuffle=shuffle if shuffle is not None else getattr(loader, "shuffle", True),
+        num_workers=nw,
+        pin_memory=getattr(loader, "pin_memory", False),
+        drop_last=drop_last if drop_last is not None else getattr(loader, "drop_last", False),
+        generator=getattr(loader, "generator", None),
+    )
+    if nw > 0:
+        dl_kw["prefetch_factor"] = getattr(loader, "prefetch_factor", None) or 2
+        dl_kw["persistent_workers"] = getattr(loader, "persistent_workers", False)
+    return DataLoader(**dl_kw)
 
 
 def load_training_meta(run_dir: Union[str, Path]) -> Dict[str, Any]:

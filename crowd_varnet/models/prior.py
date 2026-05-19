@@ -14,62 +14,17 @@ from ..deps import pedpred_models as ped_models
 def load_frozen_pedpred(
     path: str,
     device: Union[torch.device, str],
-    arch: str = "pedpred3",
+    arch: str = "pedpred3_gru_mid",
     ckpt_key: str = "model",
 ) -> nn.Module:
-    """加载已训练 PedPred / PedPred2 / PedPred3。"""
+    """Load a trained PedPred3_gru_mid teacher (only supported arch)."""
 
     arch_l = arch.lower()
-    if arch_l == "pedpred3":
-        m = ped_models.PedPred3()
-    elif arch_l == "pedpred3_wide":
-        m = ped_models.PedPred3_wide()
-    elif arch_l == "pedpred3_xwide":
-        m = ped_models.PedPred3_xwide()
-    elif arch_l == "pedpred3_unet":
-        m = ped_models.PedPred3_unet()
-    elif arch_l == "pedpred3_earth":
-        m = ped_models.PedPred3_earth()
-    elif arch_l == "pedpred3_simvp":
-        m = ped_models.PedPred3_simvp()
-    elif arch_l == "pedpred3_convnext":
-        m = ped_models.PedPred3_convnext()
-    elif arch_l == "pedpred3_gru":
-        m = ped_models.PedPred3_gru()
-    elif arch_l == "pedpred3_gru_mid":
-        m = ped_models.PedPred3_gru_mid()
-    elif arch_l == "pedpred3_gru_residual":
-        m = ped_models.PedPred3_gru_residual()
-    elif arch_l == "pedpred3_gru_mid_velresid":
-        m = ped_models.PedPred3_gru_mid_velresid()
-    elif arch_l == "pedpred3_partial_observation":
-        try:
-            from partial_observation_experiments.models import PedPred3 as _PedPred3
-        except ImportError as e:
-            raise ImportError(
-                "arch=pedpred3_partial_observation 需在 PYTHONPATH 中包含 project_analysis。"
-            ) from e
-        m = _PedPred3()
-    elif arch_l == "pedpred2":
-        try:
-            from partial_observation_experiments.models import PedPred2 as _PedPred2
-        except ImportError as e:
-            raise ImportError(
-                "arch=pedpred2 需在 PYTHONPATH 中包含 project_analysis。"
-            ) from e
-        m = _PedPred2()
-    elif arch_l == "pedpred":
-        try:
-            from partial_observation_experiments.models import PedPred as _PedPred
-        except ImportError as e:
-            raise ImportError(
-                "arch=pedpred 需在 PYTHONPATH 中包含 project_analysis。"
-            ) from e
-        m = _PedPred()
-    else:
+    if arch_l != "pedpred3_gru_mid":
         raise ValueError(
-            f"Unknown arch={arch!r}; use pedpred | pedpred2 | pedpred3 | pedpred3_partial_observation"
+            f"Unknown arch={arch!r}; only 'pedpred3_gru_mid' is supported"
         )
+    m = ped_models.PedPred3_gru_mid()
 
     dev = torch.device(device)
     if dev.type == "cuda" and not torch.cuda.is_available():
