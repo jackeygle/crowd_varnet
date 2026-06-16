@@ -107,6 +107,10 @@ class FrozenPedPredPrior(nn.Module):
         else:
             t = output if torch.is_tensor(output) else torch.as_tensor(output)
 
+        # Force pure torch.Tensor (GridData is a tensor subclass that breaks arithmetic)
+        if type(t) is not torch.Tensor:
+            t = torch.empty(t.shape, dtype=t.dtype, device=t.device).copy_(t)
+
         if t.dim() == 5:
             t = t[:, 0]
         elif t.dim() != 4:
@@ -117,6 +121,9 @@ class FrozenPedPredPrior(nn.Module):
     def forward(self, history: torch.Tensor) -> torch.Tensor:
         """history: [B,T,4,H,W] → x_prior: [B,4,H,W]，与 history 同设备。"""
         dev = history.device
+        # Ensure pure tensor input for GridData wrapping
+        if type(history) is not torch.Tensor:
+            history = torch.empty(history.shape, dtype=history.dtype, device=history.device).copy_(history)
         inp = GridData(history)
         # 全部冻结时禁用 grad，省内存；任意解冻时保持 grad 流。
         any_trainable = any(p.requires_grad for p in self.phi.parameters())
@@ -125,4 +132,8 @@ class FrozenPedPredPrior(nn.Module):
         else:
             with torch.no_grad():
                 out = self.phi(inp, horizon=1)
-        return self._unwrap_prediction(out).to(dev)
+        result = self._unwrap_prediction(out)
+        # Guarantee pure torch.Tensor (not a GridData subclass)
+        if type(result) is not torch.Tensor:
+            result = torch.empty(result.shape, dtype=result.dtype, device=result.device).copy_(result)
+        return result.to(dev)

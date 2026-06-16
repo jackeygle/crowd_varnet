@@ -89,6 +89,21 @@ g.add_argument(
     default=0,
     help="Stop after this many epochs without improving val loss; 0 = disabled",
 )
+g.add_argument(
+    "--scheduled-sampling-max",
+    type=float,
+    default=0.0,
+    help="Max probability of using own prediction in history during training "
+         "(0=disabled, 0.5=recommended). Linearly ramps from 0 to this value over 15 epochs.",
+)
+g.add_argument(
+    "--lambda-vel-unc",
+    type=float,
+    default=0.0,
+    help="Weight on the velocity-variance NLLL term. 0=legacy v13/v19 (density+vel_est only); "
+         "1=full PedPred3 NLLL (density+vel_est+vel_unc). The vel_var channel is needed "
+         "downstream for aleatoric-uncertainty propagation through the student / Deep Ensemble.",
+)
 
 cfg, sys.argv[1:] = parser.parse_known_args()
 

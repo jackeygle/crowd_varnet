@@ -1,17 +1,18 @@
 """可训练的迭代求解器（VarNet 核心）。
 
-三种 solver 实现：
-  - ``scalar`` (旧 ``use_gru=False``)：每步一个标量步长，仅 ``n_iter`` 个参数；
-  - ``gru``    (旧 ``use_gru=True``) ：``GRUCell`` per-pixel 更新，~1.3k 参数；
-  - ``convgru`` (新)                  ：``ConvGRU`` 共享空间核 + 输出头，
-                                       ~25k–300k 参数（依 hidden）；显式利用空间相邻信息。
+v2 架构改进：
+  1. Spatial Self-Attention：每步后加轻量 attention，捕捉全局依赖
+  2. 支持 ConvGRU 或 ConvLSTM 作为 RNN cell：
+     - ConvGRU + 显式 momentum（默认）
+     - ConvLSTM：cell state 天然积累动量，无需显式 momentum（跟 4DVarNet 对齐）
 
-旧 ckpt（``log_steps`` 或 ``solver.gru_cell.*``）仍可加载——
-``CrowdVarNet`` 的 ``cli._common.build_model_from_ckpt`` 会从 state_dict 键名自动推断。
+每步输入 [grad, x, x_prior, obs, obs_mask] = 17 通道，
+经 RNN + Attention 更新隐状态后通过输出头生成 4 通道 δx。
 """
 from __future__ import annotations
 
-from typing import Optional
+import math
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -21,10 +22,7 @@ from .cost import VariationalCost, clip_crowd_state
 
 
 class ConvGRUCell(nn.Module):
-    """规范 ConvGRU：用两次卷积分别算 (r,z) 与 n。
-
-    参数量 ≈ ``9 * (in+h) * (3h)``，相比 per-pixel ``GRUCell`` 多了空间核但远少于 U-Net。
-    """
+    """规范 ConvGRU：用两次卷积分别算 (r,z) 与 n。"""
 
     def __init__(self, in_ch: int, hidden: int, k: int = 3):
         super().__init__()
@@ -45,10 +43,231 @@ class ConvGRUCell(nn.Module):
         return (1 - z) * n + z * h
 
 
-class _OutHead(nn.Module):
-    """ConvGRU hidden ``[B,h,H,W]`` → 4 通道 δ：两层 Conv3x3 + GN + ReLU，再 1x1 出 4。
+class ConvLSTMCell(nn.Module):
+    """ConvLSTM cell：cell state c 天然积累动量（类似 Adam 的一阶矩）。
 
-    Tanh 软限幅避免单步过大。可选在中间插 Dropout2d 做 regularization。
+    跟 4DVarNet 原版对齐：LSTM 的 c 在迭代步之间保持"优化方向记忆"。
+    """
+
+    def __init__(self, in_ch: int, hidden: int, k: int = 3):
+        super().__init__()
+        self.hidden = hidden
+        pad = k // 2
+        # 一次卷积算 4 个 gate: input, forget, cell, output
+        self.conv_gates = nn.Conv2d(in_ch + hidden, 4 * hidden, kernel_size=k, padding=pad)
+        nn.init.xavier_uniform_(self.conv_gates.weight)
+        nn.init.zeros_(self.conv_gates.bias)
+        # Forget gate bias 初始化为 1（鼓励记忆保持）
+        with torch.no_grad():
+            self.conv_gates.bias[hidden:2*hidden].fill_(1.0)
+
+    def forward(
+        self, x: torch.Tensor, h: torch.Tensor, c: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        gates = self.conv_gates(torch.cat([x, h], dim=1))
+        i, f, g, o = gates.chunk(4, dim=1)
+        i = torch.sigmoid(i)
+        f = torch.sigmoid(f)
+        g = torch.tanh(g)
+        o = torch.sigmoid(o)
+        c_new = f * c + i * g
+        h_new = o * torch.tanh(c_new)
+        return h_new, c_new
+
+
+class ObsEncoder(nn.Module):
+    """Encode sparse observations as a sequence of tokens via Transformer.
+
+    Inputs:
+        obs: [B, 4, H, W] observation field (zeros where not observed)
+        obs_mask: [B, 1, H, W] binary mask (1=observed)
+
+    Output:
+        obs_tokens: [B, N_max, dim] encoded tokens (padded to N_max=H*W)
+        token_mask: [B, N_max] valid token mask (True=valid observation)
+
+    Each observed pixel becomes a token: [4 channel values] + [2D pos embedding].
+    Transformer self-attention lets each observation "see" all others, building
+    a global context that solver can query via cross-attention.
+    """
+
+    def __init__(self, dim: int = 128, num_layers: int = 2, num_heads: int = 4,
+                 grid_h: int = 36, grid_w: int = 12):
+        super().__init__()
+        self.dim = dim
+        self.grid_h = grid_h
+        self.grid_w = grid_w
+
+        # Position embedding: 2D sinusoidal, fixed (not learned)
+        # Each pixel (y, x) → 16-dim embedding
+        pos_dim = 16
+        self.register_buffer("pos_emb", self._build_pos_emb(grid_h, grid_w, pos_dim))
+
+        # Input projection: [4 channels + pos_dim] → dim
+        self.input_proj = nn.Linear(4 + pos_dim, dim)
+
+        # Transformer encoder
+        layer = nn.TransformerEncoderLayer(
+            d_model=dim, nhead=num_heads, dim_feedforward=dim * 2,
+            batch_first=True, activation="relu", dropout=0.0,
+        )
+        self.encoder = nn.TransformerEncoder(layer, num_layers=num_layers)
+
+    @staticmethod
+    def _build_pos_emb(H, W, dim):
+        """2D sinusoidal position embedding [H, W, dim]."""
+        d = dim // 4
+        y = torch.arange(H, dtype=torch.float32).unsqueeze(1).expand(H, W)
+        x = torch.arange(W, dtype=torch.float32).unsqueeze(0).expand(H, W)
+        freqs = torch.exp(-torch.arange(d, dtype=torch.float32) * (math.log(10000.0) / d))
+        emb_y = torch.cat([torch.sin(y.unsqueeze(-1) * freqs),
+                           torch.cos(y.unsqueeze(-1) * freqs)], dim=-1)
+        emb_x = torch.cat([torch.sin(x.unsqueeze(-1) * freqs),
+                           torch.cos(x.unsqueeze(-1) * freqs)], dim=-1)
+        return torch.cat([emb_y, emb_x], dim=-1)  # [H, W, dim]
+
+    def forward(self, obs: torch.Tensor, obs_mask: torch.Tensor):
+        """
+        obs: [B, 4, H, W], obs_mask: [B, 1, H, W]
+        Returns:
+            tokens: [B, N=H*W, dim]
+            valid_mask: [B, N] (True=valid observation)
+        """
+        B, C, H, W = obs.shape
+        # Build per-pixel feature: [4 obs values + pos_emb]
+        obs_flat = obs.permute(0, 2, 3, 1).reshape(B, H * W, 4)  # [B, N, 4]
+        pos = self.pos_emb.reshape(H * W, -1).unsqueeze(0).expand(B, -1, -1)  # [B, N, pos_dim]
+        feat = torch.cat([obs_flat, pos], dim=-1)  # [B, N, 4+pos_dim]
+        tokens = self.input_proj(feat)  # [B, N, dim]
+
+        # Build src_key_padding_mask: True = padding (unobserved → ignored in self-attn)
+        # PyTorch convention: True = mask out
+        valid = obs_mask.squeeze(1).reshape(B, H * W) > 0.5  # [B, N], True=observed
+        key_padding_mask = ~valid  # True=ignore
+
+        encoded = self.encoder(tokens, src_key_padding_mask=key_padding_mask)
+        return encoded, valid
+
+
+class CrossAttention(nn.Module):
+    """Cross-attention: solver hidden queries the global observation tokens.
+
+    For each pixel in the spatial hidden state (including unobserved regions),
+    attend to all observation tokens to gather global information.
+    """
+
+    def __init__(self, query_dim: int, kv_dim: int, num_heads: int = 4):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = query_dim // num_heads
+        assert query_dim % num_heads == 0
+
+        self.q_proj = nn.Linear(query_dim, query_dim)
+        self.k_proj = nn.Linear(kv_dim, query_dim)
+        self.v_proj = nn.Linear(kv_dim, query_dim)
+        self.out_proj = nn.Linear(query_dim, query_dim)
+        self.norm = nn.GroupNorm(min(8, query_dim), query_dim)
+
+        # Zero-init output for stable residual at init
+        nn.init.zeros_(self.out_proj.weight)
+        nn.init.zeros_(self.out_proj.bias)
+
+    def forward(self, h: torch.Tensor, obs_tokens: torch.Tensor,
+                obs_valid: torch.Tensor) -> torch.Tensor:
+        """
+        h: [B, C, H, W] solver hidden state
+        obs_tokens: [B, N, kv_dim] encoded observation tokens
+        obs_valid: [B, N] valid mask (True=valid observation)
+        Returns h + cross_attn(h, obs_tokens) [residual]
+        """
+        B, C, H, W = h.shape
+        N = obs_tokens.shape[1]
+
+        # Normalize and reshape h → [B, H*W, C]
+        h_norm = self.norm(h)
+        q_in = h_norm.flatten(2).transpose(1, 2)  # [B, H*W, C]
+
+        q = self.q_proj(q_in)  # [B, H*W, C]
+        k = self.k_proj(obs_tokens)  # [B, N, C]
+        v = self.v_proj(obs_tokens)  # [B, N, C]
+
+        # Reshape to multi-head
+        q = q.reshape(B, H * W, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.reshape(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+        v = v.reshape(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+
+        # Attention with masking on invalid observation tokens
+        scale = self.head_dim ** -0.5
+        attn = torch.matmul(q, k.transpose(-2, -1)) * scale  # [B, heads, H*W, N]
+
+        # Mask: invalid (unobserved) tokens get -inf
+        # obs_valid: [B, N] → [B, 1, 1, N]
+        attn = attn.masked_fill(~obs_valid[:, None, None, :], float("-inf"))
+        attn = F.softmax(attn, dim=-1)
+        # Handle case where all keys are masked (no observations at all): nan → 0
+        attn = torch.nan_to_num(attn, nan=0.0)
+
+        out = torch.matmul(attn, v)  # [B, heads, H*W, head_dim]
+        out = out.transpose(1, 2).reshape(B, H * W, C)
+        out = self.out_proj(out)  # [B, H*W, C]
+        out = out.transpose(1, 2).reshape(B, C, H, W)
+
+        return h + out
+
+
+class SpatialAttention(nn.Module):
+    """轻量级 spatial self-attention on hidden state.
+
+    将 [B, C, H, W] reshape 为 [B, HW, C]，做 multi-head attention，
+    再 reshape 回来。用 1x1 conv 做 Q/K/V 投影（等价于 linear on spatial tokens）。
+
+    对于 36×12 = 432 tokens，attention 计算量很小（432² × head_dim）。
+    """
+
+    def __init__(self, channels: int, num_heads: int = 4, dropout: float = 0.0):
+        super().__init__()
+        self.channels = channels
+        self.num_heads = num_heads
+        self.head_dim = channels // num_heads
+        assert channels % num_heads == 0, f"channels={channels} not divisible by num_heads={num_heads}"
+
+        self.qkv = nn.Conv2d(channels, 3 * channels, kernel_size=1)
+        self.proj = nn.Conv2d(channels, channels, kernel_size=1)
+        self.norm = nn.GroupNorm(num_groups=min(8, channels), num_channels=channels)
+        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+
+        # Zero-init output projection for residual stability
+        nn.init.zeros_(self.proj.weight)
+        nn.init.zeros_(self.proj.bias)
+
+    def forward(self, h: torch.Tensor) -> torch.Tensor:
+        """h: [B, C, H, W] → h + attention(h)"""
+        B, C, H, W = h.shape
+        N = H * W  # number of spatial tokens
+
+        # Q, K, V via 1x1 conv
+        qkv = self.qkv(self.norm(h))  # [B, 3C, H, W]
+        qkv = qkv.reshape(B, 3, self.num_heads, self.head_dim, N)  # [B, 3, heads, head_dim, N]
+        qkv = qkv.permute(1, 0, 2, 4, 3)  # [3, B, heads, N, head_dim]
+        q, k, v = qkv[0], qkv[1], qkv[2]  # each [B, heads, N, head_dim]
+
+        # Scaled dot-product attention
+        scale = self.head_dim ** -0.5
+        attn = torch.matmul(q, k.transpose(-2, -1)) * scale  # [B, heads, N, N]
+        attn = F.softmax(attn, dim=-1)
+        attn = self.dropout(attn)
+
+        out = torch.matmul(attn, v)  # [B, heads, N, head_dim]
+        out = out.permute(0, 2, 1, 3).reshape(B, C, H, W)  # [B, C, H, W]
+        out = self.proj(out)
+
+        return h + out  # residual connection
+
+
+class _OutHead(nn.Module):
+    """ConvGRU hidden → 4 通道 δ：两层 Conv3x3 + GN + ReLU，再 1x1 出 4。
+
+    Tanh 软限幅避免单步过大。可选 Dropout2d 做 regularization。
     """
 
     def __init__(self, hidden: int, mid: Optional[int] = None, dropout_p: float = 0.0):
@@ -70,7 +289,7 @@ class _OutHead(nn.Module):
             layers.append(nn.Dropout2d(p=dropout_p))
         layers.append(nn.Conv2d(m, 4, 1))
         self.body = nn.Sequential(*layers)
-        # 末层零初始化：训练初期 δ≈0，恒等于 LISTA 起点（x_init），稳定起步。
+        # 末层零初始化：训练初期 δ≈0，稳定起步。
         nn.init.zeros_(self.body[-1].weight)
         nn.init.zeros_(self.body[-1].bias)
         self.scale = nn.Parameter(torch.ones(4) * 0.5)
@@ -81,79 +300,147 @@ class _OutHead(nn.Module):
 
 
 class CrowdVarNetIterativeSolver(nn.Module):
-    """在格点状态 ``x`` 上对 ``VariationalCost`` 做多步下降。
+    """ConvGRU/ConvLSTM + Attention 迭代求解器。
 
-    ``solver_type``：
-      - ``scalar``  : 每步一个可学习标量步长（``log_steps``），向后兼容旧 ckpt；
-      - ``gru``     : per-pixel ``GRUCell``（旧 ``use_gru=True``）；
-      - ``convgru`` : 共享空间核 ConvGRU + 输出头（**推荐**）。
+    支持两种 RNN cell：
+      - "gru": ConvGRU + 显式 momentum（默认，向后兼容）
+      - "lstm": ConvLSTM，cell state 天然积累动量，无需显式 momentum（4DVarNet 风格）
 
-    旧用法 ``CrowdVarNetIterativeSolver(n_iter, use_gru=True)`` 仍工作。
+    更新公式（4DVarNet 风格）：
+      state_update = delta + lr_grad * (step+1)/n_step * grad
+      x = x - state_update
+
+    delta 来自学习版迭代器（ConvLSTM/GRU + Attention + OutHead），
+    grad 是代价函数的直接梯度。前者负责"探索"，后者负责"保证下降"。
+
+    参数：
+      n_iter: 迭代步数（默认 8）
+      hidden: RNN 隐藏通道数（默认 256）
+      kernel: 卷积核大小（默认 3）
+      share_across_iter: 是否所有迭代步共享同一组权重（默认 True）
+      dropout_p: 输出头 Dropout2d 概率（默认 0）
+      clip_each_step: 每步后是否 clip 状态到物理范围
+      use_attention: 是否启用 spatial attention（默认 True）
+      attn_heads: attention head 数（默认 4）
+      momentum_beta: momentum 系数（0=关闭，仅 gru 模式有效）
+      rnn_type: "gru" 或 "lstm"
+      lr_grad: 直接梯度项的最大权重（默认 0.0=关闭，0.2=4DVarNet 默认）
     """
 
     def __init__(
         self,
         n_iter: int = 8,
-        use_gru: bool = False,
-        gru_ch: int = 16,
-        clip_each_step: bool = True,
-        *,
-        solver_type: Optional[str] = None,
-        hidden: int = 32,
+        hidden: int = 256,
         kernel: int = 3,
         share_across_iter: bool = True,
         dropout_p: float = 0.0,
+        clip_each_step: bool = True,
+        use_attention: bool = True,
+        attn_heads: int = 4,
+        momentum_beta: float = 0.5,
+        rnn_type: str = "gru",
+        lr_grad: float = 0.0,
+        use_obs_encoder: bool = False,
+        obs_encoder_dim: int = 128,
+        obs_encoder_layers: int = 2,
+        grid_h: int = 36,
+        grid_w: int = 12,
     ):
         super().__init__()
         self.n_iter = n_iter
-        self.clip_each_step = clip_each_step
-        self.gru_ch = gru_ch
         self.hidden = hidden
-        self.dropout_p = dropout_p
+        self.clip_each_step = clip_each_step
+        self.use_attention = use_attention
+        self.momentum_beta = momentum_beta
+        self.rnn_type = rnn_type.lower()
+        self.lr_grad = float(lr_grad)
+        self.use_obs_encoder = bool(use_obs_encoder)
 
-        if solver_type is None:
-            solver_type = "gru" if use_gru else "scalar"
-        solver_type = solver_type.lower()
-        if solver_type not in ("scalar", "gru", "convgru"):
-            raise ValueError(f"solver_type must be scalar/gru/convgru, got {solver_type!r}")
-        self.solver_type = solver_type
-
-        if solver_type == "scalar":
-            self.log_steps = nn.Parameter(torch.full((n_iter,), -2.0))
-        elif solver_type == "gru":
-            self.gru_cell = nn.GRUCell(input_size=8, hidden_size=gru_ch)
-            self.gru_out = nn.Sequential(nn.Linear(gru_ch, 4), nn.Tanh())
-        else:  # convgru
-            # 输入特征 [grad(4), x(4), x_prior(4), obs(4), obs_mask(1)] = 17
-            in_ch = 17
-            if share_across_iter:
-                self.convgru = ConvGRUCell(in_ch=in_ch, hidden=hidden, k=kernel)
-                self.out_head = _OutHead(hidden, dropout_p=dropout_p)
-                self._convgru_list = None
-                self._head_list = None
+        # 输入特征 [grad(4), x(4), x_prior(4), obs(4), obs_mask(1)] = 17
+        in_ch = 17
+        if share_across_iter:
+            if self.rnn_type == "lstm":
+                self.rnn_cell = ConvLSTMCell(in_ch=in_ch, hidden=hidden, k=kernel)
             else:
-                self.convgru = None
-                self.out_head = None
-                self._convgru_list = nn.ModuleList(
+                self.rnn_cell = ConvGRUCell(in_ch=in_ch, hidden=hidden, k=kernel)
+            self.out_head = _OutHead(hidden, dropout_p=dropout_p)
+            self._rnn_list = None
+            self._head_list = None
+        else:
+            self.rnn_cell = None
+            self.out_head = None
+            if self.rnn_type == "lstm":
+                self._rnn_list = nn.ModuleList(
+                    [ConvLSTMCell(in_ch=in_ch, hidden=hidden, k=kernel) for _ in range(n_iter)]
+                )
+            else:
+                self._rnn_list = nn.ModuleList(
                     [ConvGRUCell(in_ch=in_ch, hidden=hidden, k=kernel) for _ in range(n_iter)]
                 )
-                self._head_list = nn.ModuleList([_OutHead(hidden, dropout_p=dropout_p) for _ in range(n_iter)])
-            self.share_across_iter = share_across_iter
+            self._head_list = nn.ModuleList(
+                [_OutHead(hidden, dropout_p=dropout_p) for _ in range(n_iter)]
+            )
+        self.share_across_iter = share_across_iter
 
-    def _step_convgru(
+        # Spatial attention (shared across iterations)
+        if use_attention:
+            self.attention = SpatialAttention(
+                channels=hidden, num_heads=attn_heads, dropout=dropout_p
+            )
+        else:
+            self.attention = None
+
+        # Global observation encoder + cross-attention (Perceiver-style)
+        if self.use_obs_encoder:
+            self.obs_encoder = ObsEncoder(
+                dim=obs_encoder_dim, num_layers=obs_encoder_layers,
+                num_heads=attn_heads, grid_h=grid_h, grid_w=grid_w,
+            )
+            self.cross_attn = CrossAttention(
+                query_dim=hidden, kv_dim=obs_encoder_dim, num_heads=attn_heads,
+            )
+        else:
+            self.obs_encoder = None
+            self.cross_attn = None
+
+        # Learnable momentum (only for GRU mode)
+        if self.rnn_type == "gru" and momentum_beta > 0:
+            self.momentum_coeff = nn.Parameter(torch.tensor(momentum_beta))
+        else:
+            self.momentum_coeff = None
+
+    def _step(
         self, k: int, x: torch.Tensor, grad: torch.Tensor,
         x_prior: torch.Tensor, obs: torch.Tensor, obs_mask: torch.Tensor,
-        h: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        h: torch.Tensor, c: Optional[torch.Tensor] = None,
+        obs_tokens: Optional[torch.Tensor] = None,
+        obs_valid: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         feat = torch.cat([grad, x, x_prior, obs, obs_mask], dim=1)
         if self.share_across_iter:
-            h = self.convgru(feat, h)
+            if self.rnn_type == "lstm":
+                assert c is not None
+                h, c = self.rnn_cell(feat, h, c)
+            else:
+                h = self.rnn_cell(feat, h)
+            if self.attention is not None:
+                h = self.attention(h)
+            if self.cross_attn is not None and obs_tokens is not None:
+                h = self.cross_attn(h, obs_tokens, obs_valid)
             delta = self.out_head(h)
         else:
-            assert self._convgru_list is not None and self._head_list is not None
-            h = self._convgru_list[k](feat, h)
+            assert self._rnn_list is not None and self._head_list is not None
+            if self.rnn_type == "lstm":
+                assert c is not None
+                h, c = self._rnn_list[k](feat, h, c)
+            else:
+                h = self._rnn_list[k](feat, h)
+            if self.attention is not None:
+                h = self.attention(h)
+            if self.cross_attn is not None and obs_tokens is not None:
+                h = self.cross_attn(h, obs_tokens, obs_valid)
             delta = self._head_list[k](h)
-        return delta, h
+        return delta, h, c
 
     def forward(
         self,
@@ -165,31 +452,47 @@ class CrowdVarNetIterativeSolver(nn.Module):
     ) -> torch.Tensor:
         x = x_init.clone().detach().requires_grad_(True)
         B, C, H, W = x.shape
+        h = torch.zeros(B, self.hidden, H, W, device=x.device, dtype=x.dtype)
+        c = torch.zeros_like(h) if self.rnn_type == "lstm" else None
 
-        if self.solver_type == "gru":
-            h = torch.zeros(B * H * W, self.gru_ch, device=x.device, dtype=x.dtype)
-        elif self.solver_type == "convgru":
-            h = torch.zeros(B, self.hidden, H, W, device=x.device, dtype=x.dtype)
-        else:
-            h = None
+        # Encode observations once (if obs_encoder enabled)
+        obs_tokens = None
+        obs_valid = None
+        if self.obs_encoder is not None:
+            obs_tokens, obs_valid = self.obs_encoder(obs, obs_mask)
+
+        # Momentum buffer (GRU mode only)
+        momentum = torch.zeros_like(x_init) if self.momentum_coeff is not None else None
 
         for k in range(self.n_iter):
             cost, _, _ = cost_fn(x, obs, obs_mask, x_prior)
             grad = torch.autograd.grad(cost, x, create_graph=True)[0]
 
-            if self.solver_type == "scalar":
-                x = x - torch.exp(self.log_steps[k]) * grad
-            elif self.solver_type == "gru":
-                assert h is not None
-                feat = torch.cat([grad, x.detach()], dim=1)
-                feat_flat = feat.permute(0, 2, 3, 1).reshape(B * H * W, C * 2)
-                h = self.gru_cell(feat_flat, h)
-                delta = self.gru_out(h).reshape(B, H, W, C).permute(0, 3, 1, 2)
-                x = x - delta
-            else:  # convgru
-                assert h is not None
-                delta, h = self._step_convgru(k, x, grad, x_prior, obs, obs_mask, h)
-                x = x - delta
+            delta, h, c = self._step(
+                k, x, grad, x_prior, obs, obs_mask, h, c,
+                obs_tokens=obs_tokens, obs_valid=obs_valid,
+            )
+
+            # 4DVarNet-style update: delta + direct gradient term
+            # delta provides exploration via attention/RNN
+            # direct gradient ensures cost descent (esp. in unobs regions)
+            if self.lr_grad > 0:
+                # Increasing weight on direct grad over iterations:
+                # early steps trust learned delta more, later steps trust grad
+                grad_weight = self.lr_grad * (k + 1) / self.n_iter
+                state_update = delta + grad_weight * grad
+            else:
+                state_update = delta
+
+            # Apply update
+            if momentum is not None and self.momentum_coeff is not None:
+                # GRU + explicit momentum
+                beta = torch.sigmoid(self.momentum_coeff)
+                momentum = beta * momentum + (1.0 - beta) * state_update
+                x = x - momentum
+            else:
+                # LSTM mode: no explicit momentum (cell state handles it)
+                x = x - state_update
 
             if self.clip_each_step:
                 x = clip_crowd_state(x)

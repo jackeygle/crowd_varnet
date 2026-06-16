@@ -29,10 +29,10 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 
-from crowd_varnet.cli import build_model_from_ckpt
-from crowd_varnet.deps.dataset_atc import get_atc_data
-from crowd_varnet.datasets import RolloutEpisodeDataset, unwrap_concat_base_dataset
-from crowd_varnet.models.cost import density_support_mask
+from .cli import build_model_from_ckpt
+from .deps.dataset_atc import get_atc_data
+from .datasets import RolloutEpisodeDataset, unwrap_concat_base_dataset
+from .models.cost import density_support_mask
 
 
 CH_NAMES = ("rho", "vx", "vy", "speed")

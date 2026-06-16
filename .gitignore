@@ -16,6 +16,7 @@ runs/
 logs/
 *.out
 slurm-*.out
+benchmark/results/
 
 # 权重与 HDF5 缓存（勿提交大文件；用 README 说明下载路径）
 *.pt

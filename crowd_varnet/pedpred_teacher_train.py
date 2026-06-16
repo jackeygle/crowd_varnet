@@ -49,11 +49,23 @@ loss_metric = cfg.loss
 
 
 def scalar_training_loss(metrics: Metrics):
-    if cfg.loss_vel_scale != 1.0 and loss_metric == "mean total weighted NLLL":
-        den = metrics["mean NLLL density"]
-        vel = metrics["mean weighted NLLL vel_est"] + metrics["mean weighted NLLL vel_unc"]
-        return den + cfg.loss_vel_scale * vel
-    return metrics[loss_metric]
+    """Teacher training loss: density + vel_est + lambda * vel_unc.
+
+    Setting ``cfg.lambda_vel_unc = 0`` disables the variance term (legacy v13/v19
+    behaviour); ``cfg.lambda_vel_unc = 1`` recovers the original PedPred3
+    full-NLLL objective. The variance channel matters for downstream
+    aleatoric-uncertainty propagation in the CrowdVarNet student / Deep
+    Ensemble pipeline.
+    """
+    den = metrics["mean NLLL density"]
+    vel_est = metrics["mean weighted NLLL vel_est"]
+    lambda_unc = float(getattr(cfg, "lambda_vel_unc", 0.0))
+    vel_scale = float(cfg.loss_vel_scale)
+    total = den + vel_scale * vel_est
+    if lambda_unc > 0.0:
+        vel_unc = metrics["mean weighted NLLL vel_unc"]
+        total = total + vel_scale * lambda_unc * vel_unc
+    return total
 
 
 def batch_loss(pred, target):
@@ -64,7 +76,12 @@ def batch_loss_and_decomp(pred, target):
     m = Metrics(pred, target)
     loss = scalar_training_loss(m)
     den = m["mean NLLL density"]
-    vel = m["mean weighted NLLL vel_est"] + m["mean weighted NLLL vel_unc"]
+    # Decomp 'vel' includes both vel_est and (optionally) vel_unc, so it
+    # matches the actual training objective when monitoring per-batch loss.
+    lambda_unc = float(getattr(cfg, "lambda_vel_unc", 0.0))
+    vel = m["mean weighted NLLL vel_est"]
+    if lambda_unc > 0.0:
+        vel = vel + lambda_unc * m["mean weighted NLLL vel_unc"]
     vel_x = m["mean weighted NLLL vel_est_vx"]
     vel_y = m["mean weighted NLLL vel_est_vy"]
     return loss, den, vel, vel_x, vel_y
@@ -182,12 +199,66 @@ def train(state: PedPredTeacherState, data: DataLoader):
     decomp_vel = []
     decomp_vel_x = []
     decomp_vel_y = []
+
+    # Scheduled sampling: probability of using own prediction increases with epoch
+    ss_max = float(getattr(cfg, "scheduled_sampling_max", 0.0))
+    if ss_max > 0:
+        ss_p = min(ss_max, ss_max * state.epochs / 15.0)  # linear ramp over 15 epochs
+    else:
+        ss_p = 0.0
+
     data = tqdm(data, desc=f"{state.name} training, epoch {state.epochs:,}")
     for _, (input, target) in enumerate(data):
         input, target = _maybe_flip_w(input, target, getattr(cfg, "flip_w_prob", 0.0))
         input = input.to(model_device)
         target = target.to(model_device)
-        pred = state.model(input, horizon=target.shape[1])
+
+        horizon = target.shape[1]
+        if ss_p > 0 and horizon > 1:
+            # Scheduled sampling: step-by-step forward
+            from .deps.grid_data import GridData
+            # Build input sequence step by step
+            # input: [B, T_in, C, H, W], we feed it to get first prediction
+            # then for subsequent steps, mix GT and own prediction
+            preds = []
+            current_input = input  # [B, T_in, C, H, W]
+            for t in range(horizon):
+                pred_t = state.model(current_input, horizon=1)  # predict 1 step
+                preds.append(pred_t)
+                if t < horizon - 1:
+                    # Decide next input: use own pred or GT
+                    if torch.rand(()).item() < ss_p:
+                        # Use own prediction as next input frame
+                        if hasattr(pred_t, 'as_tensor'):
+                            next_frame = pred_t.as_tensor('density', 'vel_mean', 'vel_var')
+                        else:
+                            next_frame = pred_t
+                        if next_frame.dim() == 5:
+                            next_frame = next_frame[:, 0:1]  # [B, 1, C, H, W]
+                        elif next_frame.dim() == 4:
+                            next_frame = next_frame.unsqueeze(1)
+                    else:
+                        # Use GT target frame as next input
+                        gt_frame = target[:, t:t+1]  # [B, 1, C, H, W]
+                        if hasattr(gt_frame, 'as_tensor'):
+                            next_frame = gt_frame.as_tensor('density', 'vel_mean', 'vel_var')
+                        else:
+                            next_frame = gt_frame
+                        if next_frame.dim() == 4:
+                            next_frame = next_frame.unsqueeze(1)
+                    # Shift input window: drop first frame, append next_frame
+                    if hasattr(current_input, 'as_tensor'):
+                        ci = current_input.as_tensor('density', 'vel_mean', 'vel_var')
+                    else:
+                        ci = current_input
+                    current_input = GridData(torch.cat([ci[:, 1:], next_frame.detach()], dim=1))
+            # Stack predictions
+            pred = torch.cat([p if torch.is_tensor(p) else p.as_tensor('density', 'vel_mean', 'vel_var') for p in preds], dim=1)
+            pred = GridData(pred)
+        else:
+            # Standard forward (no scheduled sampling)
+            pred = state.model(input, horizon=horizon)
+
         loss, den_t, vel_t, vx_t, vy_t = batch_loss_and_decomp(pred, target)
         data.set_postfix_str(_fmt_nlll_postfix(loss, den_t, vel_t, vx_t, vy_t))
         if not loss.isfinite():
