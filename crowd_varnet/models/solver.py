@@ -216,12 +216,10 @@ class CrossAttention(nn.Module):
 
 
 class SpatialAttention(nn.Module):
-    """轻量级 spatial self-attention on hidden state.
+    """Global spatial self-attention (kept for backward compat / small grids).
 
-    将 [B, C, H, W] reshape 为 [B, HW, C]，做 multi-head attention，
-    再 reshape 回来。用 1x1 conv 做 Q/K/V 投影（等价于 linear on spatial tokens）。
-
-    对于 36×12 = 432 tokens，attention 计算量很小（432² × head_dim）。
+    将 [B, C, H, W] reshape 为 [B, HW, C]，做 multi-head attention。
+    复杂度 O(N²)，N=H*W。大分辨率（60×96=5760）时请用 WindowSpatialAttention。
     """
 
     def __init__(self, channels: int, num_heads: int = 4, dropout: float = 0.0):
@@ -236,32 +234,103 @@ class SpatialAttention(nn.Module):
         self.norm = nn.GroupNorm(num_groups=min(8, channels), num_channels=channels)
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
 
-        # Zero-init output projection for residual stability
         nn.init.zeros_(self.proj.weight)
         nn.init.zeros_(self.proj.bias)
 
     def forward(self, h: torch.Tensor) -> torch.Tensor:
-        """h: [B, C, H, W] → h + attention(h)"""
         B, C, H, W = h.shape
-        N = H * W  # number of spatial tokens
-
-        # Q, K, V via 1x1 conv
-        qkv = self.qkv(self.norm(h))  # [B, 3C, H, W]
-        qkv = qkv.reshape(B, 3, self.num_heads, self.head_dim, N)  # [B, 3, heads, head_dim, N]
-        qkv = qkv.permute(1, 0, 2, 4, 3)  # [3, B, heads, N, head_dim]
-        q, k, v = qkv[0], qkv[1], qkv[2]  # each [B, heads, N, head_dim]
-
-        # Scaled dot-product attention
+        N = H * W
+        qkv = self.qkv(self.norm(h))
+        qkv = qkv.reshape(B, 3, self.num_heads, self.head_dim, N)
+        qkv = qkv.permute(1, 0, 2, 4, 3)
+        q, k, v = qkv[0], qkv[1], qkv[2]
         scale = self.head_dim ** -0.5
-        attn = torch.matmul(q, k.transpose(-2, -1)) * scale  # [B, heads, N, N]
-        attn = F.softmax(attn, dim=-1)
+        attn = F.softmax(torch.matmul(q, k.transpose(-2, -1)) * scale, dim=-1)
+        attn = self.dropout(attn)
+        out = torch.matmul(attn, v).permute(0, 2, 1, 3).reshape(B, C, H, W)
+        return h + self.proj(out)
+
+
+class WindowSpatialAttention(nn.Module):
+    """Window-based local spatial self-attention.
+
+    将 [B, C, H, W] 切成 wh×ww 的不重叠窗口，在每个窗口内做 self-attention，
+    再拼回来。复杂度 O(N * wh * ww) vs 全局的 O(N²)。
+
+    对于 60×96 网格，window_h=6, window_w=8 → 120 个窗口，每窗口 48 tokens，
+    attention 矩阵 48² vs 全局 5760²，快约 120 倍。
+    人群交互天然局部，这个设计更符合物理假设。
+    """
+
+    def __init__(self, channels: int, num_heads: int = 4,
+                 window_h: int = 6, window_w: int = 8, dropout: float = 0.0):
+        super().__init__()
+        self.channels = channels
+        self.num_heads = num_heads
+        self.head_dim = channels // num_heads
+        self.window_h = window_h
+        self.window_w = window_w
+        assert channels % num_heads == 0
+
+        self.qkv = nn.Conv2d(channels, 3 * channels, kernel_size=1)
+        self.proj = nn.Conv2d(channels, channels, kernel_size=1)
+        self.norm = nn.GroupNorm(num_groups=min(8, channels), num_channels=channels)
+        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+
+        nn.init.zeros_(self.proj.weight)
+        nn.init.zeros_(self.proj.bias)
+
+    def _to_windows(self, x: torch.Tensor, wh: int, ww: int) -> torch.Tensor:
+        """[B, C, Hp, Wp] → [B*nw, ws, C]，ws=wh*ww"""
+        B, C, H, W = x.shape
+        nh, nwc = H // wh, W // ww
+        x = x.reshape(B, C, nh, wh, nwc, ww)
+        x = x.permute(0, 2, 4, 3, 5, 1).contiguous()  # [B, nh, nwc, wh, ww, C]
+        return x.reshape(B * nh * nwc, wh * ww, C)
+
+    def _from_windows(self, x: torch.Tensor, B: int, H: int, W: int, wh: int, ww: int) -> torch.Tensor:
+        """[B*nw, ws, C] → [B, C, H, W]"""
+        nh, nwc, C = H // wh, W // ww, x.shape[-1]
+        x = x.reshape(B, nh, nwc, wh, ww, C)
+        x = x.permute(0, 5, 1, 3, 2, 4).contiguous()  # [B, C, nh, wh, nwc, ww]
+        return x.reshape(B, C, H, W)
+
+    def forward(self, h: torch.Tensor) -> torch.Tensor:
+        B, C, H, W = h.shape
+        wh, ww = self.window_h, self.window_w
+
+        # Pad so H, W are divisible by window size
+        pad_h = (wh - H % wh) % wh
+        pad_w = (ww - W % ww) % ww
+        h_pad = F.pad(h, (0, pad_w, 0, pad_h)) if (pad_h or pad_w) else h
+        Hp, Wp = h_pad.shape[2], h_pad.shape[3]
+
+        qkv = self.qkv(self.norm(h_pad))  # [B, 3C, Hp, Wp]
+
+        # Split into Q/K/V windows
+        ws = wh * ww
+        nw = (Hp // wh) * (Wp // ww)
+        q_win = self._to_windows(qkv[:, :C], wh, ww)          # [B*nw, ws, C]
+        k_win = self._to_windows(qkv[:, C:2*C], wh, ww)
+        v_win = self._to_windows(qkv[:, 2*C:], wh, ww)
+
+        Bnw = B * nw
+        q_win = q_win.reshape(Bnw, ws, self.num_heads, self.head_dim).transpose(1, 2)
+        k_win = k_win.reshape(Bnw, ws, self.num_heads, self.head_dim).transpose(1, 2)
+        v_win = v_win.reshape(Bnw, ws, self.num_heads, self.head_dim).transpose(1, 2)
+
+        scale = self.head_dim ** -0.5
+        attn = F.softmax(torch.matmul(q_win, k_win.transpose(-2, -1)) * scale, dim=-1)
         attn = self.dropout(attn)
 
-        out = torch.matmul(attn, v)  # [B, heads, N, head_dim]
-        out = out.permute(0, 2, 1, 3).reshape(B, C, H, W)  # [B, C, H, W]
-        out = self.proj(out)
+        out = torch.matmul(attn, v_win)                         # [B*nw, heads, ws, head_dim]
+        out = out.transpose(1, 2).reshape(Bnw, ws, C)
+        out = self._from_windows(out, B, Hp, Wp, wh, ww)        # [B, C, Hp, Wp]
 
-        return h + out  # residual connection
+        if pad_h or pad_w:
+            out = out[:, :, :H, :W]
+
+        return h + self.proj(out)
 
 
 class _OutHead(nn.Module):
@@ -339,12 +408,15 @@ class CrowdVarNetIterativeSolver(nn.Module):
         attn_heads: int = 4,
         momentum_beta: float = 0.5,
         rnn_type: str = "gru",
-        lr_grad: float = 0.0,
+        lr_grad: float = 0.1,
         use_obs_encoder: bool = False,
         obs_encoder_dim: int = 128,
         obs_encoder_layers: int = 2,
         grid_h: int = 36,
         grid_w: int = 12,
+        local_attn: bool = True,
+        attn_window_h: int = 6,
+        attn_window_w: int = 8,
     ):
         super().__init__()
         self.n_iter = n_iter
@@ -353,8 +425,13 @@ class CrowdVarNetIterativeSolver(nn.Module):
         self.use_attention = use_attention
         self.momentum_beta = momentum_beta
         self.rnn_type = rnn_type.lower()
-        self.lr_grad = float(lr_grad)
+        # Learnable lr_grad: lets the model discover the right gradient step size.
+        # relu-clamped in forward to keep it non-negative.
+        self.lr_grad = nn.Parameter(torch.tensor(float(lr_grad)))
         self.use_obs_encoder = bool(use_obs_encoder)
+        self.local_attn = local_attn
+        self.attn_window_h = attn_window_h
+        self.attn_window_w = attn_window_w
 
         # 输入特征 [grad(4), x(4), x_prior(4), obs(4), obs_mask(1)] = 17
         in_ch = 17
@@ -384,9 +461,16 @@ class CrowdVarNetIterativeSolver(nn.Module):
 
         # Spatial attention (shared across iterations)
         if use_attention:
-            self.attention = SpatialAttention(
-                channels=hidden, num_heads=attn_heads, dropout=dropout_p
-            )
+            if local_attn:
+                self.attention = WindowSpatialAttention(
+                    channels=hidden, num_heads=attn_heads,
+                    window_h=attn_window_h, window_w=attn_window_w,
+                    dropout=dropout_p,
+                )
+            else:
+                self.attention = SpatialAttention(
+                    channels=hidden, num_heads=attn_heads, dropout=dropout_p,
+                )
         else:
             self.attention = None
 
@@ -473,14 +557,19 @@ class CrowdVarNetIterativeSolver(nn.Module):
                 obs_tokens=obs_tokens, obs_valid=obs_valid,
             )
 
-            # 4DVarNet-style update: delta + direct gradient term
-            # delta provides exploration via attention/RNN
-            # direct gradient ensures cost descent (esp. in unobs regions)
-            if self.lr_grad > 0:
-                # Increasing weight on direct grad over iterations:
-                # early steps trust learned delta more, later steps trust grad
-                grad_weight = self.lr_grad * (k + 1) / self.n_iter
-                state_update = delta + grad_weight * grad
+            # 4DVarNet-style update: delta + direct gradient term.
+            # lr_grad is a learnable parameter (relu-clamped to stay non-negative).
+            # The gradient is L2-normalised per batch item so asymmetric prior
+            # weighting (0.05 in unobserved cells) doesn't suppress it to near-zero.
+            lr_grad_val = F.relu(self.lr_grad)
+            if lr_grad_val > 0:
+                grad_norm = (
+                    grad.flatten(1).norm(dim=1, keepdim=True)
+                    .view(B, 1, 1, 1)
+                    .clamp(min=1e-8)
+                )
+                grad_weight = lr_grad_val * (k + 1) / self.n_iter
+                state_update = delta + grad_weight * (grad / grad_norm)
             else:
                 state_update = delta
 
