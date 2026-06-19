@@ -116,6 +116,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                    help="4DVarNet-style direct gradient weight (0=disabled, 0.2=4DVarNet default). "
                         "When >0, update = delta + lr_grad * (step+1)/n_iter * grad. "
                         "This pushes solver to follow cost gradient even in unobs regions.")
+    p.add_argument("--solver-attn-type", type=str, default=None,
+                   choices=("global", "window", "axial"),
+                   help="Spatial attention 类型：global=全局O(N^2)（旧默认）; "
+                        "window=局部窗口; axial=沿H/W分轴(O(N(H+W))，保留长程传播，"
+                        "推荐稀疏重建)。不指定时回退 global。")
     p.add_argument("--solver-use-obs-encoder", action="store_true",
                    help="Enable global observation encoder (Perceiver-style): "
                         "Transformer encodes all obs pixels into tokens; solver hidden "
@@ -294,6 +299,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         prior_unobs_weight=float(args.prior_unobs_weight),
         solver_lr_grad=float(args.solver_lr_grad),
         solver_use_obs_encoder=bool(args.solver_use_obs_encoder),
+        solver_attn_type=args.solver_attn_type,
     ).to(device)
 
     if args.warmstart:

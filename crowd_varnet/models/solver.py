@@ -333,6 +333,59 @@ class WindowSpatialAttention(nn.Module):
         return h + self.proj(out)
 
 
+class AxialSpatialAttention(nn.Module):
+    """Factorized axial self-attention：沿 H 轴和 W 轴分别做 self-attention。
+
+    复杂度 O(N·(H+W)) vs 全局 O(N²)，但每个像素仍能在两跳内到达场内任意位置，
+    保留了 inverse problem 需要的长程信息传播（window attention 砍掉的正是这个）。
+
+    走廊各向异性：沿走廊（一个轴）与横跨走廊（另一个轴）的相互作用尺度不同，
+    分轴建模在物理上比各向同性的窗口更合理。H 轴与 W 轴并行计算后相加。
+    """
+
+    def __init__(self, channels: int, num_heads: int = 4, dropout: float = 0.0):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = channels // num_heads
+        assert channels % num_heads == 0, f"channels={channels} not divisible by num_heads={num_heads}"
+        self.channels = channels
+
+        self.norm = nn.GroupNorm(num_groups=min(8, channels), num_channels=channels)
+        self.qkv_h = nn.Conv2d(channels, 3 * channels, kernel_size=1)
+        self.qkv_w = nn.Conv2d(channels, 3 * channels, kernel_size=1)
+        self.proj = nn.Conv2d(channels, channels, kernel_size=1)
+        self.drop = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+
+        nn.init.zeros_(self.proj.weight)
+        nn.init.zeros_(self.proj.bias)
+
+    def _axis_attn(self, qkv: torch.Tensor, B: int, C: int, L: int, M: int) -> torch.Tensor:
+        """qkv: [B, 3C, L, M]，沿 L 轴做 attention，M 折叠进 batch。返回 [B, C, L, M]。"""
+        nh, hd = self.num_heads, self.head_dim
+        qkv = qkv.permute(0, 3, 1, 2).reshape(B * M, 3 * C, L)  # [B*M, 3C, L]
+        q, k, v = qkv.chunk(3, dim=1)                            # each [B*M, C, L]
+
+        def to_heads(t: torch.Tensor) -> torch.Tensor:
+            return t.reshape(B * M, nh, hd, L).permute(0, 1, 3, 2)  # [B*M, nh, L, hd]
+
+        q, k, v = to_heads(q), to_heads(k), to_heads(v)
+        attn = torch.matmul(q, k.transpose(-2, -1)) * (hd ** -0.5)  # [B*M, nh, L, L]
+        attn = self.drop(F.softmax(attn, dim=-1))
+        out = torch.matmul(attn, v)                                 # [B*M, nh, L, hd]
+        out = out.permute(0, 1, 3, 2).reshape(B * M, C, L)          # [B*M, C, L]
+        return out.reshape(B, M, C, L).permute(0, 2, 3, 1)          # [B, C, L, M]
+
+    def forward(self, h: torch.Tensor) -> torch.Tensor:
+        B, C, H, W = h.shape
+        hn = self.norm(h)
+        # H 轴：L=H, M=W
+        out_h = self._axis_attn(self.qkv_h(hn), B, C, H, W)               # [B, C, H, W]
+        # W 轴：转置后 L=W, M=H，算完再转回来
+        qkv_w = self.qkv_w(hn).transpose(2, 3)                            # [B, 3C, W, H]
+        out_w = self._axis_attn(qkv_w, B, C, W, H).transpose(2, 3)        # [B, C, H, W]
+        return h + self.proj(out_h + out_w)
+
+
 class _OutHead(nn.Module):
     """ConvGRU hidden → 4 通道 δ：两层 Conv3x3 + GN + ReLU，再 1x1 出 4。
 
@@ -414,9 +467,10 @@ class CrowdVarNetIterativeSolver(nn.Module):
         obs_encoder_layers: int = 2,
         grid_h: int = 36,
         grid_w: int = 12,
-        local_attn: bool = True,
+        local_attn: bool = False,  # 已被 attn_type 取代；保留仅为旧调用兼容
         attn_window_h: int = 6,
         attn_window_w: int = 8,
+        attn_type: Optional[str] = None,
     ):
         super().__init__()
         self.n_iter = n_iter
@@ -425,11 +479,22 @@ class CrowdVarNetIterativeSolver(nn.Module):
         self.use_attention = use_attention
         self.momentum_beta = momentum_beta
         self.rnn_type = rnn_type.lower()
-        # Learnable lr_grad: lets the model discover the right gradient step size.
-        # relu-clamped in forward to keep it non-negative.
-        self.lr_grad = nn.Parameter(torch.tensor(float(lr_grad)))
+        # Learnable lr_grad. softplus 保证恒正且处处有梯度，避免 relu 在 0 点
+        # 梯度为 0 导致 Parameter 初始化在 0 时永久卡死（直接梯度项变成死代码）。
+        # use_grad_term=False 时整段直接关闭，便于 A/B 消融。
+        self.use_grad_term = float(lr_grad) > 0
+        if self.use_grad_term:
+            # 存 raw，使 softplus(raw) == lr_grad，有效初值精确等于传入值
+            # （否则 softplus(0.2)≈0.80 会把梯度项强度放大 4x）。
+            raw_init = math.log(math.expm1(float(lr_grad)))
+            self.lr_grad = nn.Parameter(torch.tensor(raw_init))
+        else:
+            self.register_parameter("lr_grad", None)
         self.use_obs_encoder = bool(use_obs_encoder)
-        self.local_attn = local_attn
+        # attn_type 优先；未指定时由 local_attn 回退（保持旧 checkpoint 行为）
+        if attn_type is None:
+            attn_type = "window" if local_attn else "global"
+        self.attn_type = attn_type.lower()
         self.attn_window_h = attn_window_h
         self.attn_window_w = attn_window_w
 
@@ -461,16 +526,22 @@ class CrowdVarNetIterativeSolver(nn.Module):
 
         # Spatial attention (shared across iterations)
         if use_attention:
-            if local_attn:
+            if self.attn_type == "axial":
+                self.attention = AxialSpatialAttention(
+                    channels=hidden, num_heads=attn_heads, dropout=dropout_p,
+                )
+            elif self.attn_type == "window":
                 self.attention = WindowSpatialAttention(
                     channels=hidden, num_heads=attn_heads,
                     window_h=attn_window_h, window_w=attn_window_w,
                     dropout=dropout_p,
                 )
-            else:
+            elif self.attn_type == "global":
                 self.attention = SpatialAttention(
                     channels=hidden, num_heads=attn_heads, dropout=dropout_p,
                 )
+            else:
+                raise ValueError(f"unknown attn_type={self.attn_type!r}")
         else:
             self.attention = None
 
@@ -558,13 +629,12 @@ class CrowdVarNetIterativeSolver(nn.Module):
             )
 
             # 4DVarNet-style update: delta + direct gradient term.
-            # lr_grad is a learnable parameter (relu-clamped to stay non-negative).
-            # The gradient is L2-normalised per batch item so asymmetric prior
-            # weighting (0.05 in unobserved cells) doesn't suppress it to near-zero.
-            lr_grad_val = F.relu(self.lr_grad)
-            if lr_grad_val > 0:
+            # lr_grad via softplus → 恒正、处处有梯度（不会卡死）。梯度按 batch
+            # 做 L2 归一化，使非观测区先验权重 0.05 不会把梯度压到近零。
+            if self.use_grad_term:
+                lr_grad_val = F.softplus(self.lr_grad)
                 grad_norm = (
-                    grad.flatten(1).norm(dim=1, keepdim=True)
+                    grad.flatten(1).norm(dim=1)
                     .view(B, 1, 1, 1)
                     .clamp(min=1e-8)
                 )

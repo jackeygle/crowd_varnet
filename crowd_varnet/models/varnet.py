@@ -84,6 +84,7 @@ class CrowdVarNet(nn.Module):
         prior_unobs_weight: float = 0.05,
         solver_lr_grad: float = 0.0,
         solver_use_obs_encoder: bool = False,
+        solver_attn_type: Optional[str] = None,
     ):
         super().__init__()
         self.T_hist = T_hist
@@ -111,6 +112,7 @@ class CrowdVarNet(nn.Module):
             rnn_type=solver_rnn_type,
             lr_grad=solver_lr_grad,
             use_obs_encoder=solver_use_obs_encoder,
+            attn_type=solver_attn_type,
         )
 
         self.predict_uncertainty = bool(predict_uncertainty)
